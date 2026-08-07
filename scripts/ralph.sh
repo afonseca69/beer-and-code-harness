@@ -25,7 +25,8 @@
 #   --engine codex|claude    engine de implementacao (default: codex)
 #   --from N                 comeca na fase N (limpa do progresso as fases >= N)
 #   --keep-going             continua apos uma fase falhar (default: para)
-#   --max-cycles N           ciclos de correcao por fase (default: 3)
+#   --max-cycles N           hard cap total de ciclos por fase (default: 12)
+#   --max-stalled-cycles N   ciclos corretivos sem progresso (default: 2)
 #   --verify-model MODEL     modelo do verificador (flag > RALPH_VERIFY_MODEL)
 #   --verify-reasoning E     reasoning Codex: minimal|low|medium|high|xhigh
 #   --no-verify              desliga o gate 3 (equivale a RALPH_VERIFY=off)
@@ -87,7 +88,8 @@
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
 #   RALPH_VERIFY_MODEL       modelo do verificador (default: haiku no claude)
 #   RALPH_VERIFY_REASONING   reasoning do verificador Codex
-#   RALPH_MAX_CYCLES         ciclos de correcao por fase (default: 3)
+#   RALPH_MAX_CYCLES         hard cap total de ciclos por fase (default: 12)
+#   RALPH_MAX_STALLED_CYCLES ciclos corretivos sem progresso (default: 2)
 #   RALPH_MAX_LIMIT_WAITS    esperas consecutivas por limite, por fase (default: 20)
 #   RALPH_LIMIT_WAIT_DEFAULT fallback de espera em segundos (default: 1800)
 #   RALPH_LIMIT_BUFFER       segundos extras apos o reset (default: 60)
@@ -114,7 +116,8 @@ INPUT_FILE=""
 FROM_PHASE=0
 KEEP_GOING=false
 TEST_CMD_FLAG=""
-MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
+MAX_CYCLES="${RALPH_MAX_CYCLES:-12}"
+MAX_STALLED_CYCLES="${RALPH_MAX_STALLED_CYCLES:-2}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
 VERIFY_MODEL=""
 VERIFY_MODEL_FLAG=""
@@ -136,6 +139,8 @@ while [[ $# -gt 0 ]]; do
     --from=*)      FROM_PHASE="${1#*=}"; shift ;;
     --max-cycles)  MAX_CYCLES="$2"; shift 2 ;;
     --max-cycles=*) MAX_CYCLES="${1#*=}"; shift ;;
+    --max-stalled-cycles) MAX_STALLED_CYCLES="$2"; shift 2 ;;
+    --max-stalled-cycles=*) MAX_STALLED_CYCLES="${1#*=}"; shift ;;
     --verify-model) VERIFY_MODEL_FLAG="$2"; VERIFY_MODEL_FLAG_SET=true; shift 2 ;;
     --verify-model=*) VERIFY_MODEL_FLAG="${1#*=}"; VERIFY_MODEL_FLAG_SET=true; shift ;;
     --verify-reasoning) VERIFY_REASONING_FLAG="$2"; VERIFY_REASONING_FLAG_SET=true; shift 2 ;;
@@ -557,6 +562,11 @@ preflight_checks() {
     exit 1
   fi
 
+  if ! [[ "$MAX_STALLED_CYCLES" =~ ^[0-9]+$ ]] || [ "$MAX_STALLED_CYCLES" -lt 1 ]; then
+    fail "Valor invalido para --max-stalled-cycles: '$MAX_STALLED_CYCLES'. Use um inteiro >= 1."
+    exit 1
+  fi
+
   case "$VERIFY_MODE" in
     auto|always|off) ;;
     *)
@@ -879,6 +889,8 @@ antes de mudar qualquer coisa.
 - Corrija APENAS o que falta. Nao reimplemente o que ja esta correto e testado.
 - Nao deixe TODOs, placeholders ou testes pulados.
 - Rode a suite de testes do projeto ao final e garanta que ela passa.
+- Requisitos de autenticacao, autorizacao, isolamento, policies, gates ou permissoes da aplicacao sao escopo funcional aprovado quando constam do texto da fase ou da causa do gate. Implemente e teste esses requisitos sem pausar apenas por envolverem autorizacao.
+- Essa autorizacao funcional nao amplia a autorizacao operacional: nao contorne sandbox, allowlist, regras do projeto, segredos, chamadas externas nao autorizadas ou outros limites operacionais; nao execute migrations destrutivas, deploy, push nem alteracoes fora do escopo da fase.
 INTRO
     echo
     echo "## Motivo da falha ($gate)"
@@ -1122,6 +1134,30 @@ tree_signature() {
     git diff HEAD
     git ls-files --others --exclude-standard -z | xargs -0 -r sha256sum 2> /dev/null
   } 2> /dev/null | sha256sum | cut -c1-16
+}
+
+# A observacao de que uma sessao nao escreveu e util no prompt, mas nao muda o
+# finding do gate. Remova esse prefixo e normalize whitespace para que pequenas
+# diferencas de formatacao nao escondam uma repeticao sem progresso.
+normalize_gate_cause() {
+  local cause="$1"
+  printf '%s' "$cause" |
+    sed 's/^A sessao anterior terminou sem alterar nenhum arquivo\. //' |
+    tr '\n\r\t' '   ' |
+    sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+gate_cause_fingerprint() {
+  local gate="$1" cause="$2" normalized_cause
+  normalized_cause=$(normalize_gate_cause "$cause")
+  printf '%s\n%s\n' "$gate" "$normalized_cause" | sha256sum | cut -c1-16
+}
+
+# A assinatura corretiva combina o finding estavel com o estado real da
+# arvore. So e estagnacao quando gate, causa e arvore permanecem iguais.
+remediation_signature() {
+  local gate="$1" cause="$2"
+  printf '%s:%s\n' "$(gate_cause_fingerprint "$gate" "$cause")" "$(tree_signature)"
 }
 
 # Paths de trabalho atuais, sem staging nem qualquer outra mutacao do index.
@@ -1381,8 +1417,10 @@ run_phase() {
   echo ""
   log "[$seq/$total] Phase $phase_num: $phase_title"
 
-  local cycle=1
+  local cycle=1 stalled_cycles=0 previous_failure_signature="" last_cycle=0
+  local stop_reason="hard cap"
   while [ "$cycle" -le "$MAX_CYCLES" ]; do
+    last_cycle="$cycle"
     export RALPH_PHASE_ATTEMPT="$cycle"
     [ "$cycle" -gt 1 ] && warn "Ciclo de correcao $cycle/$MAX_CYCLES..."
 
@@ -1458,14 +1496,43 @@ run_phase() {
       return 0
     fi
 
+    local current_failure_signature previous_stalled_cycles
+    current_failure_signature=$(remediation_signature "$LAST_GATE" "$GATE_CAUSE")
+
+    if [ -n "$previous_failure_signature" ]; then
+      if [ "$current_failure_signature" = "$previous_failure_signature" ]; then
+        stalled_cycles=$((stalled_cycles + 1))
+        warn "Sem progresso corretivo: gate, causa e arvore repetidos ($stalled_cycles/$MAX_STALLED_CYCLES)."
+      else
+        previous_stalled_cycles="$stalled_cycles"
+        stalled_cycles=0
+        if [ "$previous_stalled_cycles" -gt 0 ]; then
+          log "Progresso detectado: gate, causa ou arvore mudou; estagnacao zerada (era $previous_stalled_cycles)."
+        fi
+      fi
+    fi
+    previous_failure_signature="$current_failure_signature"
+
+    if [ "$stalled_cycles" -ge "$MAX_STALLED_CYCLES" ]; then
+      local stalled_gate="$LAST_GATE" stalled_cause="$GATE_CAUSE"
+      stop_reason="estagnacao"
+      LAST_GATE="estagnacao — sem progresso (ultimo gate: $stalled_gate)"
+      GATE_CAUSE="Estagnacao detectada: $stalled_cycles/$MAX_STALLED_CYCLES ciclos corretivos consecutivos sem progresso (ultimo gate: $stalled_gate)."$'\n'"Gate, causa normalizada e assinatura da arvore permaneceram iguais."$'\n'"Ultima causa do gate:"$'\n'"$stalled_cause"
+      break
+    fi
+
     cycle=$((cycle + 1))
   done
 
   local phase_duration=$(($(date +%s) - phase_start))
   collect_phase_files
-  record_phase_report "$phase_num" "$phase_title" "falhou" "$MAX_CYCLES" "$(format_duration "$phase_duration")" "$LAST_TEST_RESULT" "$LAST_VERIFY_RESULT" "$LAST_PHASE_COMMIT" "$LAST_PHASE_FILES" "$LAST_GATE"
-  phase_summary "$phase_num" "$phase_title" "$seq" "$total" "falhou" "$(format_duration "$phase_duration")" "$MAX_CYCLES" "$LAST_GATE" "$LOG_DIR/${phase_file%.md}.*"
-  fail "Phase $phase_num: $phase_title — FALHOU apos $MAX_CYCLES ciclos ($(format_duration "$phase_duration"))"
+  record_phase_report "$phase_num" "$phase_title" "falhou" "$last_cycle" "$(format_duration "$phase_duration")" "$LAST_TEST_RESULT" "$LAST_VERIFY_RESULT" "$LAST_PHASE_COMMIT" "$LAST_PHASE_FILES" "$LAST_GATE"
+  phase_summary "$phase_num" "$phase_title" "$seq" "$total" "falhou" "$(format_duration "$phase_duration")" "$last_cycle" "$LAST_GATE" "$LOG_DIR/${phase_file%.md}.*"
+  if [ "$stop_reason" = "estagnacao" ]; then
+    fail "Phase $phase_num: $phase_title — FALHOU por estagnacao apos $last_cycle ciclos ($(format_duration "$phase_duration"))"
+  else
+    fail "Phase $phase_num: $phase_title — FALHOU apos $MAX_CYCLES ciclos ($(format_duration "$phase_duration"))"
+  fi
   fail "Ultima causa ($LAST_GATE):"
   printf '%s\n' "$GATE_CAUSE" | head -n 20 | sed 's/^/    /'
   fail "Logs em: $LOG_DIR/${phase_file%.md}.*"
@@ -1504,7 +1571,7 @@ main() {
   fi
 
   echo ""
-  log "$total_phases fases para implementar (engine: $ENGINE, max-cycles: $MAX_CYCLES)"
+  log "$total_phases fases para implementar (engine: $ENGINE, max-cycles: $MAX_CYCLES, max-stalled-cycles: $MAX_STALLED_CYCLES)"
   [ "$FROM_PHASE" -gt 1 ] && log "Iniciando a partir da fase $FROM_PHASE"
   echo ""
 

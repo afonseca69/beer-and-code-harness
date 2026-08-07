@@ -144,7 +144,63 @@ if [ "$verify" -eq 1 ]; then
     exit 0
   fi
 
-  if [[ "$scenario" == "verify-incomplete-once" || "$scenario" == "verify-incomplete-tracked" ]] && [ "$n" -eq 1 ]; then
+  if [ "$scenario" = "layered-findings" ]; then
+    case "$n" in
+      1)
+        echo "TASK 1: INCOMPLETE — falta a camada de persistencia"
+        echo "TASK 2: DONE"
+        ;;
+      2)
+        echo "TASK 1: DONE"
+        echo "TASK 2: INCOMPLETE — falta a camada de servico"
+        ;;
+      3)
+        echo "TASK 1: INCOMPLETE — falta validar workspace autorizado"
+        echo "TASK 2: DONE"
+        ;;
+      *)
+        for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
+        ;;
+    esac
+  elif [ "$scenario" = "stagnant-finding" ]; then
+    echo "TASK 1: INCOMPLETE — mesmo finding sem progresso"
+    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
+  elif [ "$scenario" = "normalized-finding" ]; then
+    if [ "$n" -eq 1 ]; then
+      echo "TASK 1: INCOMPLETE — mesmo finding normalizado"
+    else
+      echo "TASK 1: INCOMPLETE — mesmo   finding   normalizado"
+    fi
+    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
+  elif [ "$scenario" = "finding-progress" ]; then
+    case "$n" in
+      1|2) echo "TASK 1: INCOMPLETE — finding camada A" ;;
+      3|4) echo "TASK 1: INCOMPLETE — finding camada B" ;;
+      *) echo "TASK 1: DONE" ;;
+    esac
+    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
+  elif [ "$scenario" = "tree-progress" ]; then
+    if [ "$n" -le 2 ]; then
+      echo "TASK 1: INCOMPLETE — finding constante com arvore evoluindo"
+    else
+      echo "TASK 1: DONE"
+    fi
+    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
+  elif [ "$scenario" = "gate-progress" ]; then
+    if [ "$n" -eq 1 ]; then
+      echo "TASK 1: INCOMPLETE — finding depois do gate 2"
+    else
+      echo "TASK 1: DONE"
+    fi
+    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
+  elif [ "$scenario" = "workspace-authorized" ]; then
+    if [ "$n" -eq 1 ]; then
+      echo "TASK 1: INCOMPLETE — falta validar workspace autorizado"
+    else
+      echo "TASK 1: DONE"
+    fi
+    for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
+  elif [[ "$scenario" == "verify-incomplete-once" || "$scenario" == "verify-incomplete-tracked" ]] && [ "$n" -eq 1 ]; then
     echo "TASK 1: INCOMPLETE — o arquivo nao foi criado"
     for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
   elif [ "$scenario" = "verify-duplicate" ]; then
@@ -183,6 +239,11 @@ write=1
 [ "$scenario" = "empty-diff" ] && write=0
 [ "$scenario" = "already-done" ] && write=0
 [ "$scenario" = "stall-after-red" ] && [ "$n" -gt 1 ] && write=0
+[ "$scenario" = "stagnant-finding" ] && [ "$n" -gt 1 ] && write=0
+[ "$scenario" = "normalized-finding" ] && [ "$n" -gt 1 ] && write=0
+[ "$scenario" = "finding-progress" ] && [ "$n" -gt 1 ] && write=0
+[ "$scenario" = "gate-progress" ] && [ "$n" -gt 1 ] && write=0
+[ "$scenario" = "workspace-authorized" ] && [ "$n" -gt 1 ] && write=0
 
 if [ "$write" -eq 1 ]; then
   mkdir -p src
@@ -255,7 +316,7 @@ f="$state/test_calls"; n=0
 [ -f "$f" ] && n=$(cat "$f")
 n=$((n + 1)); echo "$n" > "$f"
 
-if [ "$scenario" = "test-red-once" ] || [ "$scenario" = "stall-after-red" ]; then
+if [ "$scenario" = "test-red-once" ] || [ "$scenario" = "stall-after-red" ] || [ "$scenario" = "gate-progress" ]; then
   if [ "$n" -eq 1 ]; then
     echo "1 failing test: ExpectedFooTest"
     exit 1
@@ -287,6 +348,28 @@ Projeto de teste.
 ## Phase 2: Feature
 
 - [ ] **Task:** cria o arquivo C
+  - **Acceptance criteria:**
+    - o arquivo existe
+
+## Open Questions
+
+- nenhuma
+'
+
+SINGLE_PHASES_FIXTURE='# Test Project — Project Phases
+
+<!-- inputs: project-description.md@sha256:000000000000 -->
+
+## Overview
+
+Projeto de teste.
+
+## Phase 1: Progressive Remediation
+
+- [ ] **Task:** cria o arquivo A
+  - **Acceptance criteria:**
+    - o arquivo existe
+- [ ] **Task:** cria o arquivo B
   - **Acceptance criteria:**
     - o arquivo existe
 
@@ -349,6 +432,16 @@ new_case() {
   echo "$dir"
 }
 
+use_single_phase_fixture() {
+  local dir="$1"
+  (
+    cd "$dir/repo" || exit 1
+    printf '%s' "$SINGLE_PHASES_FIXTURE" > .spec/init/project-phases.md
+    git add -A
+    git commit -q -m "chore: single phase fixture"
+  )
+}
+
 # run_ralph <dir> <scenario> [args...] -> ecoa o exit code; log em <dir>/out.log
 run_ralph() {
   local dir="$1" scenario="$2"; shift 2
@@ -364,6 +457,8 @@ run_ralph() {
     RALPH_VERIFY="${CASE_VERIFY:-}" \
     RALPH_VERIFY_MODEL="${CASE_VERIFY_MODEL:-}" \
     RALPH_VERIFY_REASONING="${CASE_VERIFY_REASONING:-}" \
+    RALPH_MAX_CYCLES="${CASE_MAX_CYCLES:-}" \
+    RALPH_MAX_STALLED_CYCLES="${CASE_MAX_STALLED_CYCLES:-}" \
       bash "$RALPH" "$@" > "$dir/out.log" 2>&1
   ) || rc=$?
   echo "$rc"
@@ -883,6 +978,138 @@ if case_enabled verify-log-required; then
   assert_contains "$d2/out.log" "Log de verificacao ausente" "causa de log ausente e explicita"
   assert_contains "$d2/out.log" "log: .phases/logs/phase-01.verify-1.log" "caminho ausente permanece no resumo"
   assert_eq 1 "$(commits "$d2")" "log ausente nao cria commit"
+fi
+
+# ---------------------------------------------------------------------------
+# 29. Findings sucessivos ultrapassam tres ciclos pelo default novo e chegam
+#     ao quarto Gate 3 verde, ainda com um unico commit de fase.
+# ---------------------------------------------------------------------------
+if case_enabled layered-findings; then
+  header "29. findings em camadas chegam ao quarto ciclo"
+  d=$(new_case layered-findings)
+  use_single_phase_fixture "$d"
+  before=$(commits "$d")
+  rc=$(run_ralph "$d" layered-findings --engine claude --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "default permite concluir no ciclo 4"
+  assert_eq $((before + 1)) "$(commits "$d")" "um unico commit de fase"
+  assert_eq 4 "$(cat "$d/state/impl_calls")" "quatro sessoes de implementacao"
+  assert_eq 4 "$(cat "$d/state/verify_calls")" "quarto Gate 3 ficou verde"
+  assert_contains "$d/out.log" "Ciclo de correcao 4/12" "default total e 12 ciclos"
+  assert_contains "$d/out.log" "Gate 3 verde (2/2 tasks) | ciclo: 4" "resumo registra o Gate 3 verde final"
+fi
+
+# ---------------------------------------------------------------------------
+# 30. --max-cycles continua sendo hard cap explicito: o mesmo fluxo em
+#     camadas para no terceiro finding, sem commit.
+# ---------------------------------------------------------------------------
+if case_enabled layered-hard-cap; then
+  header "30. hard cap explicito interrompe findings em camadas"
+  d=$(new_case layered-hard-cap)
+  use_single_phase_fixture "$d"
+  before=$(commits "$d")
+  rc=$(run_ralph "$d" layered-findings --engine claude --test-cmd "$d/test.sh" --max-cycles 3)
+  assert_eq 1 "$rc" "hard cap 3 falha antes do Gate 3 verde"
+  assert_eq "$before" "$(commits "$d")" "hard cap nao cria commit de fase"
+  assert_eq 3 "$(cat "$d/state/impl_calls")" "hard cap executa exatamente tres ciclos"
+  assert_contains "$d/out.log" "FALHOU apos 3 ciclos" "diagnostico preserva o hard cap"
+  assert_not_contains "$d/out.log" "FALHOU por estagnacao" "findings novos nao viram estagnacao"
+
+  d2=$(new_case layered-hard-cap-env)
+  use_single_phase_fixture "$d2"
+  rc=$(CASE_MAX_CYCLES=3 run_ralph "$d2" layered-findings --engine claude --test-cmd "$d2/test.sh")
+  assert_eq 1 "$rc" "RALPH_MAX_CYCLES preserva o hard cap explicito"
+  assert_eq 3 "$(cat "$d2/state/impl_calls")" "hard cap por env tambem executa tres ciclos"
+fi
+
+# ---------------------------------------------------------------------------
+# 31. Gate, causa e arvore repetidos param por estagnacao. Default 2 significa
+#     duas tentativas corretivas consecutivas sem progresso apos a referencia.
+# ---------------------------------------------------------------------------
+if case_enabled remediation-stagnation; then
+  header "31. repeticao sem progresso para por estagnacao"
+  d=$(new_case remediation-stagnation)
+  use_single_phase_fixture "$d"
+  before=$(commits "$d")
+  rc=$(run_ralph "$d" stagnant-finding --engine claude --test-cmd "$d/test.sh")
+  assert_eq 1 "$rc" "estagnacao reprova a fase"
+  assert_eq "$before" "$(commits "$d")" "estagnacao nao cria commit"
+  assert_eq 3 "$(cat "$d/state/impl_calls")" "default para apos dois ciclos corretivos estagnados"
+  assert_contains "$d/out.log" "Estagnacao detectada: 2/2 ciclos corretivos consecutivos sem progresso" "diagnostico proprio informa o contador"
+  assert_contains "$d/out.log" "ultimo gate: gate 3 — verificacao independente" "diagnostico preserva o ultimo gate"
+  assert_contains "$d/out.log" "verificacao: Gate 3 vermelho (cobertura: 2/2; incompletas: 1) | ciclo: 3 | log: .phases/logs/phase-01.verify-3.log" "resumo preserva ultimo Gate 3 e log"
+  assert_contains "$d/out.log" "arquivos: src/impl-1.txt" "estagnacao lista paths parciais"
+
+  d2=$(new_case remediation-stagnation-env)
+  use_single_phase_fixture "$d2"
+  rc=$(CASE_MAX_STALLED_CYCLES=1 run_ralph "$d2" stagnant-finding --engine claude --test-cmd "$d2/test.sh")
+  assert_eq 1 "$rc" "RALPH_MAX_STALLED_CYCLES configura a trava"
+  assert_eq 2 "$(cat "$d2/state/impl_calls")" "env 1 para na primeira repeticao corretiva"
+
+  d3=$(new_case remediation-stagnation-flag)
+  use_single_phase_fixture "$d3"
+  rc=$(CASE_MAX_STALLED_CYCLES=1 run_ralph "$d3" stagnant-finding --engine claude --test-cmd "$d3/test.sh" --max-stalled-cycles 2)
+  assert_eq 1 "$rc" "flag de estagnacao prevalece sobre env"
+  assert_eq 3 "$(cat "$d3/state/impl_calls")" "flag 2 exige duas repeticoes corretivas"
+
+  d4=$(new_case remediation-stagnation-invalid)
+  rc=$(run_ralph "$d4" ok --engine claude --test-cmd "$d4/test.sh" --max-stalled-cycles 0)
+  assert_eq 1 "$rc" "estagnacao zero falha no preflight"
+  assert_contains "$d4/out.log" "Valor invalido para --max-stalled-cycles" "validacao exige inteiro >= 1"
+  test -f "$d4/state/impl_calls" && bad "valor invalido nao inicia engine" || ok "valor invalido nao inicia engine"
+
+  d5=$(new_case remediation-stagnation-env-invalid)
+  rc=$(CASE_MAX_STALLED_CYCLES=invalido run_ralph "$d5" ok --engine claude --test-cmd "$d5/test.sh")
+  assert_eq 1 "$rc" "env de estagnacao invalida falha no preflight"
+  assert_contains "$d5/out.log" "Valor invalido para --max-stalled-cycles" "validacao tambem cobre RALPH_MAX_STALLED_CYCLES"
+
+  d6=$(new_case remediation-stagnation-normalized)
+  use_single_phase_fixture "$d6"
+  rc=$(run_ralph "$d6" normalized-finding --engine claude --test-cmd "$d6/test.sh" --max-stalled-cycles 1)
+  assert_eq 1 "$rc" "diferenca apenas de whitespace continua sendo estagnacao"
+  assert_eq 2 "$(cat "$d6/state/impl_calls")" "causa normalizada produz fingerprint estavel"
+fi
+
+# ---------------------------------------------------------------------------
+# 32. Finding, gate ou arvore diferentes sao progresso e zeram a estagnacao.
+# ---------------------------------------------------------------------------
+if case_enabled remediation-progress; then
+  header "32. finding, gate e arvore diferentes permitem continuar"
+  d=$(new_case remediation-finding-progress)
+  use_single_phase_fixture "$d"
+  rc=$(run_ralph "$d" finding-progress --engine claude --test-cmd "$d/test.sh" --max-cycles 6)
+  assert_eq 0 "$rc" "finding novo permite chegar ao verde"
+  assert_eq 5 "$(cat "$d/state/impl_calls")" "finding novo zerou estagnacao no ciclo 3"
+  assert_contains "$d/out.log" "Progresso detectado: gate, causa ou arvore mudou; estagnacao zerada (era 1)" "reset por finding e observavel"
+
+  d2=$(new_case remediation-tree-progress)
+  use_single_phase_fixture "$d2"
+  rc=$(run_ralph "$d2" tree-progress --engine claude --test-cmd "$d2/test.sh" --max-cycles 3 --max-stalled-cycles 1)
+  assert_eq 0 "$rc" "arvore alterada evita falso positivo de estagnacao"
+  assert_eq 3 "$(cat "$d2/state/impl_calls")" "mesmo finding continuou enquanto a arvore mudou"
+
+  d3=$(new_case remediation-gate-progress)
+  use_single_phase_fixture "$d3"
+  rc=$(run_ralph "$d3" gate-progress --engine claude --test-cmd "$d3/test.sh" --max-cycles 3 --max-stalled-cycles 1)
+  assert_eq 0 "$rc" "gate diferente evita falso positivo de estagnacao"
+  assert_contains "$d3/out.log" "Gate 2 vermelho" "primeira falha veio do Gate 2"
+  assert_contains "$d3/out.log" "Gate 3 vermelho" "falha seguinte veio do Gate 3"
+fi
+
+# ---------------------------------------------------------------------------
+# 33. Finding funcional de workspace chega verbatim ao corretor, que recebe
+#     autorizacao funcional explicita sem enfraquecer limites operacionais.
+# ---------------------------------------------------------------------------
+if case_enabled workspace-authorization; then
+  header "33. autorizacao funcional aprovada no prompt corretivo"
+  d=$(new_case workspace-authorization)
+  use_single_phase_fixture "$d"
+  rc=$(run_ralph "$d" workspace-authorized --engine claude --test-cmd "$d/test.sh" --max-cycles 2)
+  assert_eq 0 "$rc" "finding de workspace chega ao ciclo corretivo e conclui"
+  prompt="$d/repo/.phases/prompts/phase-01.cycle-2.txt"
+  assert_contains "$prompt" "TASK 1: INCOMPLETE — falta validar workspace autorizado" "finding chega verbatim ao corretor"
+  assert_contains "$prompt" "autenticacao, autorizacao, isolamento, policies, gates ou permissoes da aplicacao sao escopo funcional aprovado" "prompt aprova autorizacao funcional dentro da fase ou causa"
+  assert_contains "$prompt" "nao contorne sandbox, allowlist, regras do projeto, segredos, chamadas externas nao autorizadas" "prompt preserva guardrails operacionais"
+  assert_contains "$prompt" "migrations destrutivas, deploy, push" "prompt mantem operacoes destrutivas proibidas"
 fi
 
 # ---------------------------------------------------------------------------
