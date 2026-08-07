@@ -68,6 +68,7 @@ bump() {
 }
 
 model=""
+reasoning=""
 
 if [ "$name" = "claude" ]; then
   # claude -p real le stdin quando nao e TTY: se o ralph nao redirecionar
@@ -88,6 +89,14 @@ else
     case "$1" in
       --sandbox) [ "$2" = "read-only" ] && verify=1; shift 2 ;;
       --model) model="$2"; shift 2 ;;
+      -c)
+        if [[ "$2" == model_reasoning_effort=* ]]; then
+          reasoning="${2#*=}"
+          reasoning="${reasoning#\"}"
+          reasoning="${reasoning%\"}"
+        fi
+        shift 2
+        ;;
       *) shift ;;
     esac
   done
@@ -100,6 +109,9 @@ grep -q '^RALPH_VERIFY' <<< "$prompt" && verify=1
 if [ "$verify" -eq 1 ] && [ -n "$model" ]; then
   echo "$model" > "$state/verify_model"
 fi
+if [ "$verify" -eq 1 ] && [ -n "$reasoning" ]; then
+  echo "$reasoning" > "$state/verify_reasoning"
+fi
 
 # --- verificador independente ------------------------------------------------
 # Verifica o CODIGO REAL, como o verificador de verdade: sem arquivo de
@@ -107,6 +119,22 @@ fi
 if [ "$verify" -eq 1 ]; then
   n=$(bump verify_calls)
   tasks=$(grep -cE '^[[:space:]]*- \[[ x]\]' <<< "$prompt")
+
+  if [ "$scenario" = "verify-log-empty" ] || [ "$scenario" = "verify-log-missing" ]; then
+    exit 0
+  fi
+
+  if [ "$name" = "codex" ]; then
+    echo "OpenAI Codex mock"
+    echo "--------"
+    echo "model: ${model:-gpt-mock-inherited}"
+    echo "provider: mock"
+    echo "approval: never"
+    echo "sandbox: read-only"
+    echo "reasoning effort: ${reasoning:-medium}"
+    echo "reasoning summaries: none"
+    echo "--------"
+  fi
 
   implemented=0
   compgen -G "src/impl-*.txt" > /dev/null 2>&1 && implemented=1
@@ -116,7 +144,7 @@ if [ "$verify" -eq 1 ]; then
     exit 0
   fi
 
-  if [ "$scenario" = "verify-incomplete-once" ] && [ "$n" -eq 1 ]; then
+  if [[ "$scenario" == "verify-incomplete-once" || "$scenario" == "verify-incomplete-tracked" ]] && [ "$n" -eq 1 ]; then
     echo "TASK 1: INCOMPLETE — o arquivo nao foi criado"
     for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
   elif [ "$scenario" = "verify-duplicate" ]; then
@@ -160,6 +188,9 @@ if [ "$write" -eq 1 ]; then
   mkdir -p src
   echo "impl $n" > "src/impl-$n.txt"
 fi
+if [ "$scenario" = "verify-incomplete-tracked" ]; then
+  echo "modificado $n" > tracked.txt
+fi
 
 if [ "$scenario" = "false-429" ]; then
   # 429 no MEIO do log: e output de teste do projeto, nao limite de uso.
@@ -176,6 +207,24 @@ MOCK
   chmod +x "$bin/mock-engine"
   cp "$bin/mock-engine" "$bin/claude"
   cp "$bin/mock-engine" "$bin/codex"
+
+  cat > "$bin/tee" <<'TEEMOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${MOCK_SCENARIO:-}" = "verify-log-missing" ]; then
+  for path in "$@"; do
+    if [[ "$path" == *verify-*.log ]]; then
+      cat > /dev/null
+      rm -f -- "$path"
+      exit 0
+    fi
+  done
+fi
+
+exec /usr/bin/tee "$@"
+TEEMOCK
+  chmod +x "$bin/tee"
 
   cat > "$bin/rtk" <<'RTK'
 #!/usr/bin/env bash
@@ -314,6 +363,7 @@ run_ralph() {
     RALPH_LIMIT_BUFFER=1 \
     RALPH_VERIFY="${CASE_VERIFY:-}" \
     RALPH_VERIFY_MODEL="${CASE_VERIFY_MODEL:-}" \
+    RALPH_VERIFY_REASONING="${CASE_VERIFY_REASONING:-}" \
       bash "$RALPH" "$@" > "$dir/out.log" 2>&1
   ) || rc=$?
   echo "$rc"
@@ -342,6 +392,7 @@ if case_enabled ok-first; then
   assert_contains "$d/out.log" "RESUMO DE ENTREGA" "relatorio final inclui resumo consolidado"
   assert_contains "$d/out.log" "testes: Gate 2 verde" "resumo registra a validacao da suite"
   assert_contains "$d/out.log" "verificacao: Gate 3 verde (2/2 tasks)" "resumo registra a verificacao independente"
+  assert_contains "$d/out.log" "verificacao: Gate 3 verde (2/2 tasks) | ciclo: 1 | log: .phases/logs/phase-01.verify-1.log" "resumo verde registra ciclo e log"
   assert_contains "$d/out.log" "commit: " "resumo registra o commit da fase"
   assert_contains "$d/out.log" "arquivos: src/impl-1.txt" "resumo registra os arquivos do commit"
   assert_contains "$d/out.log" "Pendencias do run: nenhuma." "resumo declara ausencia de pendencias"
@@ -380,6 +431,7 @@ if case_enabled empty-diff; then
   assert_contains "$d/out.log" "Gate 3 vermelho" "verificador reprovou contra o codigo real"
   assert_contains "$d/out.log" "Parando na primeira fase que falhou" "politica default = parar"
   assert_contains "$d/repo/.phases/prompts/phase-01.cycle-2.txt" "sem alterar nenhum arquivo" "causa do ciclo cita a sessao vazia"
+  assert_contains "$d/out.log" "arquivos: nenhum" "fase sem mudancas continua reportando nenhum path"
 fi
 
 # ---------------------------------------------------------------------------
@@ -679,12 +731,20 @@ fi
 if case_enabled dirty-after-fail; then
   header "18. fase falhou com trabalho na arvore -> instrui o dev"
   d=$(new_case dirty-after-fail)
-  # verify-incomplete-once com 1 ciclo: escreve, testes verdes, verificador reprova
-  rc=$(run_ralph "$d" verify-incomplete-once --engine claude --test-cmd "$d/test.sh" --max-cycles 1)
+  echo "original" > "$d/repo/tracked.txt"
+  git -C "$d/repo" add tracked.txt
+  git -C "$d/repo" commit -q -m "chore: arquivo rastreado"
+  before=$(commits "$d")
+  # Escreve um path novo e modifica um rastreado; o verificador reprova.
+  rc=$(run_ralph "$d" verify-incomplete-tracked --engine claude --test-cmd "$d/test.sh" --max-cycles 1)
   assert_eq 1 "$rc" "exit 1"
-  assert_eq 1 "$(commits "$d")" "nenhum commit"
+  assert_eq "$before" "$(commits "$d")" "nenhum commit de fase"
   assert_contains "$d/out.log" "trabalho parcial desta fase ficou na arvore" "avisou sobre a arvore suja"
   assert_contains "$d/out.log" "git clean -fd" "deu a saida de descarte"
+  assert_contains "$d/out.log" "verificacao: Gate 3 vermelho (cobertura: 2/2; incompletas: 1) | ciclo: 1 | log: .phases/logs/phase-01.verify-1.log" "resumo registra Gate 3 vermelho executado"
+  assert_not_contains "$d/out.log" "verificacao: Gate 3 nao executado" "resumo nao mente que o Gate 3 foi pulado"
+  assert_contains "$d/out.log" "arquivos: src/impl-1.txt, tracked.txt" "resumo lista paths novo e modificado"
+  git -C "$d/repo" diff --cached --quiet && ok "coleta de paths nao altera o index" || bad "coleta de paths nao altera o index"
 fi
 
 # ---------------------------------------------------------------------------
@@ -738,6 +798,91 @@ if case_enabled verify-model; then
   rc=$(CASE_VERIFY_MODEL=sonnet run_ralph "$d2" already-done --engine claude --test-cmd "$d2/test.sh" --max-cycles 1)
   assert_eq 0 "$rc" "exit 0 (override)"
   assert_eq "sonnet" "$(cat "$d2/state/verify_model" 2>/dev/null)" "RALPH_VERIFY_MODEL sobrepoe o default"
+fi
+
+# ---------------------------------------------------------------------------
+# 25. Flags de modelo/reasoning prevalecem sobre env e reasoning chega ao
+#     Codex como model_reasoning_effort. Sem override, a config e herdada.
+# ---------------------------------------------------------------------------
+if case_enabled verify-config; then
+  header "25. configuracao deterministica do verificador Codex"
+  d=$(new_case verify-config)
+  rc=$(CASE_VERIFY_MODEL=env-model CASE_VERIFY_REASONING=low run_ralph "$d" ok \
+    --engine codex --test-cmd "$d/test.sh" --max-cycles 1 --quiet \
+    --verify-model flag-model --verify-reasoning high)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq "flag-model" "$(cat "$d/state/verify_model" 2>/dev/null)" "flag de modelo prevalece sobre env"
+  assert_eq "high" "$(cat "$d/state/verify_reasoning" 2>/dev/null)" "flag de reasoning prevalece sobre env"
+  assert_contains "$d/state/codex_args" 'model_reasoning_effort="high"' "reasoning passado via model_reasoning_effort"
+  assert_contains "$d/state/codex_args" "read-only" "verificacao Codex continua em sandbox read-only"
+  assert_contains "$d/out.log" "modelo: flag-model | reasoning: high" "inicio do gate mostra config solicitada"
+
+  d2=$(new_case verify-config-env)
+  rc=$(CASE_VERIFY_MODEL=env-model CASE_VERIFY_REASONING=xhigh run_ralph "$d2" ok \
+    --engine codex --test-cmd "$d2/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0 com fallback em env"
+  assert_eq "env-model" "$(cat "$d2/state/verify_model" 2>/dev/null)" "modelo herdado do env"
+  assert_eq "xhigh" "$(cat "$d2/state/verify_reasoning" 2>/dev/null)" "reasoning herdado do env"
+fi
+
+# ---------------------------------------------------------------------------
+# 26. Reasoning invalido no Codex e qualquer override no Claude falham no
+#     preflight, antes da primeira sessao de engine.
+# ---------------------------------------------------------------------------
+if case_enabled verify-preflight; then
+  header "26. preflight valida reasoning sem consumir sessoes"
+  d=$(new_case verify-reasoning-invalid)
+  rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh" --verify-reasoning turbo)
+  assert_eq 1 "$rc" "reasoning Codex invalido falha"
+  assert_contains "$d/out.log" "Reasoning invalido para o verificador Codex" "erro lista a incompatibilidade"
+  test -f "$d/state/impl_calls" && bad "reasoning invalido nao inicia implementacao" || ok "reasoning invalido nao inicia implementacao"
+  test -f "$d/state/verify_calls" && bad "reasoning invalido nao inicia verificacao" || ok "reasoning invalido nao inicia verificacao"
+
+  d2=$(new_case verify-reasoning-claude)
+  rc=$(CASE_VERIFY_REASONING=medium run_ralph "$d2" ok --engine claude --test-cmd "$d2/test.sh")
+  assert_eq 1 "$rc" "override de reasoning no Claude falha"
+  assert_contains "$d2/out.log" "Reasoning do verificador nao e compativel com o engine Claude" "erro Claude e claro"
+  test -f "$d2/state/impl_calls" && bad "Claude incompatível nao inicia implementacao" || ok "Claude incompatível nao inicia implementacao"
+  test -f "$d2/state/verify_calls" && bad "Claude incompatível nao inicia verificacao" || ok "Claude incompatível nao inicia verificacao"
+fi
+
+# ---------------------------------------------------------------------------
+# 27. Codex quiet espelha apenas modelo/reasoning efetivos, mas preserva o
+#     cabecalho completo no log do Gate 3.
+# ---------------------------------------------------------------------------
+if case_enabled verify-runtime-quiet; then
+  header "27. runtime efetivo do Codex aparece em quiet"
+  d=$(new_case verify-runtime-quiet)
+  rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh" --max-cycles 1 --quiet)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "Gate 3 — gravando | engine: codex | modelo: herdado | reasoning: herdado | sandbox: read-only | log: .phases/logs/phase-01.verify-1.log" "inicio informa config, sandbox, log e gravacao"
+  assert_contains "$d/out.log" "model: gpt-mock-inherited" "terminal mostra modelo efetivo"
+  assert_contains "$d/out.log" "reasoning effort: medium" "terminal mostra reasoning efetivo"
+  assert_not_contains "$d/out.log" "provider: mock" "quiet nao espelha o cabecalho inteiro"
+  assert_contains "$d/repo/.phases/logs/phase-01.verify-1.log" "OpenAI Codex mock" "log preserva inicio do cabecalho"
+  assert_contains "$d/repo/.phases/logs/phase-01.verify-1.log" "provider: mock" "log preserva metadados integrais"
+  assert_contains "$d/repo/.phases/logs/phase-01.verify-1.log" "reasoning summaries: none" "log preserva fim do cabecalho"
+fi
+
+# ---------------------------------------------------------------------------
+# 28. Gate 3 reprova explicitamente log ausente ou vazio e registra a causa
+#     operacional no resumo consolidado.
+# ---------------------------------------------------------------------------
+if case_enabled verify-log-required; then
+  header "28. log do Gate 3 e obrigatorio"
+  d=$(new_case verify-log-empty)
+  rc=$(run_ralph "$d" verify-log-empty --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 1 "$rc" "log vazio reprova"
+  assert_contains "$d/out.log" "Log de verificacao vazio" "causa de log vazio e explicita"
+  assert_contains "$d/out.log" "verificacao: Gate 3 vermelho (cobertura: 0/2; incompletas: indisponivel) | ciclo: 1 | log: .phases/logs/phase-01.verify-1.log" "resumo vermelho inclui cobertura, ciclo e log"
+  assert_eq 1 "$(commits "$d")" "log vazio nao cria commit"
+
+  d2=$(new_case verify-log-missing)
+  rc=$(run_ralph "$d2" verify-log-missing --engine codex --test-cmd "$d2/test.sh" --max-cycles 1)
+  assert_eq 1 "$rc" "log ausente reprova"
+  assert_contains "$d2/out.log" "Log de verificacao ausente" "causa de log ausente e explicita"
+  assert_contains "$d2/out.log" "log: .phases/logs/phase-01.verify-1.log" "caminho ausente permanece no resumo"
+  assert_eq 1 "$(commits "$d2")" "log ausente nao cria commit"
 fi
 
 # ---------------------------------------------------------------------------

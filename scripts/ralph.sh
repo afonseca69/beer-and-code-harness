@@ -26,6 +26,8 @@
 #   --from N                 comeca na fase N (limpa do progresso as fases >= N)
 #   --keep-going             continua apos uma fase falhar (default: para)
 #   --max-cycles N           ciclos de correcao por fase (default: 3)
+#   --verify-model MODEL     modelo do verificador (flag > RALPH_VERIFY_MODEL)
+#   --verify-reasoning E     reasoning Codex: minimal|low|medium|high|xhigh
 #   --no-verify              desliga o gate 3 (equivale a RALPH_VERIFY=off)
 #   --test-cmd "<cmd>"       comando de teste do projeto (gate 2)
 #   -q, --quiet              oculta o output dos engines; exibe um resumo por fase
@@ -84,6 +86,7 @@
 #   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
 #   RALPH_VERIFY_MODEL       modelo do verificador (default: haiku no claude)
+#   RALPH_VERIFY_REASONING   reasoning do verificador Codex
 #   RALPH_MAX_CYCLES         ciclos de correcao por fase (default: 3)
 #   RALPH_MAX_LIMIT_WAITS    esperas consecutivas por limite, por fase (default: 20)
 #   RALPH_LIMIT_WAIT_DEFAULT fallback de espera em segundos (default: 1800)
@@ -114,6 +117,11 @@ TEST_CMD_FLAG=""
 MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
 VERIFY_MODEL=""
+VERIFY_MODEL_FLAG=""
+VERIFY_MODEL_FLAG_SET=false
+VERIFY_REASONING=""
+VERIFY_REASONING_FLAG=""
+VERIFY_REASONING_FLAG_SET=false
 QUIET="${RALPH_QUIET:-false}"
 PROFILE="default"
 ALLOWED_PATHS_FILE=""
@@ -128,6 +136,10 @@ while [[ $# -gt 0 ]]; do
     --from=*)      FROM_PHASE="${1#*=}"; shift ;;
     --max-cycles)  MAX_CYCLES="$2"; shift 2 ;;
     --max-cycles=*) MAX_CYCLES="${1#*=}"; shift ;;
+    --verify-model) VERIFY_MODEL_FLAG="$2"; VERIFY_MODEL_FLAG_SET=true; shift 2 ;;
+    --verify-model=*) VERIFY_MODEL_FLAG="${1#*=}"; VERIFY_MODEL_FLAG_SET=true; shift ;;
+    --verify-reasoning) VERIFY_REASONING_FLAG="$2"; VERIFY_REASONING_FLAG_SET=true; shift 2 ;;
+    --verify-reasoning=*) VERIFY_REASONING_FLAG="${1#*=}"; VERIFY_REASONING_FLAG_SET=true; shift ;;
     --test-cmd)    TEST_CMD_FLAG="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
     --keep-going)  KEEP_GOING=true; shift ;;
@@ -562,11 +574,40 @@ preflight_checks() {
   esac
 
   # Verificacao e leitura + checklist: nao precisa do modelo de implementacao.
-  # No codex nao ha default seguro de modelo barato — so aplica se pedido.
-  if [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
+  # Flags prevalecem sobre env; vazio significa herdar a configuracao do Codex.
+  if [ "$VERIFY_MODEL_FLAG_SET" = true ]; then
+    if [ -z "$VERIFY_MODEL_FLAG" ]; then
+      fail "--verify-model exige um valor nao vazio."
+      exit 1
+    fi
+    VERIFY_MODEL="$VERIFY_MODEL_FLAG"
+  elif [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
     VERIFY_MODEL="$RALPH_VERIFY_MODEL"
   elif [[ "$ENGINE" == "claude" ]]; then
     VERIFY_MODEL="haiku"
+  fi
+
+  if [ "$VERIFY_REASONING_FLAG_SET" = true ]; then
+    if [ -z "$VERIFY_REASONING_FLAG" ]; then
+      fail "--verify-reasoning exige um valor nao vazio."
+      exit 1
+    fi
+    VERIFY_REASONING="$VERIFY_REASONING_FLAG"
+  elif [ -n "${RALPH_VERIFY_REASONING:-}" ]; then
+    VERIFY_REASONING="$RALPH_VERIFY_REASONING"
+  fi
+
+  if [[ "$ENGINE" == "codex" && -n "$VERIFY_REASONING" ]]; then
+    case "$VERIFY_REASONING" in
+      minimal|low|medium|high|xhigh) ;;
+      *)
+        fail "Reasoning invalido para o verificador Codex: '$VERIFY_REASONING'. Use minimal, low, medium, high ou xhigh."
+        exit 1
+        ;;
+    esac
+  elif [[ "$ENGINE" == "claude" && -n "$VERIFY_REASONING" ]]; then
+    fail "Reasoning do verificador nao e compativel com o engine Claude. Remova --verify-reasoning/RALPH_VERIFY_REASONING."
+    exit 1
   fi
 
   if [[ "$ENGINE" == "codex" ]]; then
@@ -967,9 +1008,19 @@ wait_for_reset() {
 # Loop de resiliencia a limite de uso: nao consome ciclo de correcao.
 capture_engine_output() {
   local log_file="$1"
+  local mode="$2"
 
   if [ "$QUIET" = true ]; then
-    cat > "$log_file"
+    if [[ "$mode" == "verify" && "$ENGINE" == "codex" ]]; then
+      # O stream completo continua no log. No terminal quiet, exponha somente
+      # os metadados efetivos do cabecalho Codex necessarios para auditoria.
+      tee "$log_file" | awk '
+        /^model: / && !model_seen { print; fflush(); model_seen = 1 }
+        /^reasoning effort: / && !reasoning_seen { print; fflush(); reasoning_seen = 1 }
+      '
+    else
+      cat > "$log_file"
+    fi
   else
     tee "$log_file"
   fi
@@ -981,9 +1032,12 @@ run_engine() {
   export RALPH_ENGINE="$ENGINE"
   export RALPH_PHASE_MAX_ATTEMPTS="$MAX_CYCLES"
 
-  local model_args=()
+  local model_args=() reasoning_args=()
   if [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
     model_args=(--model "$VERIFY_MODEL")
+  fi
+  if [[ "$mode" == "verify" && "$ENGINE" == "codex" ]] && [ -n "$VERIFY_REASONING" ]; then
+    reasoning_args=(-c "model_reasoning_effort=\"$VERIFY_REASONING\"")
   fi
 
   while true; do
@@ -992,15 +1046,15 @@ run_engine() {
     if [[ "$ENGINE" == "codex" ]]; then
       if [[ "$mode" == "verify" ]]; then
         if is_system4u_profile; then
-          rtk codex exec -c 'approval_policy="never"' --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" || rc=$?
+          rtk codex exec -c 'approval_policy="never"' --sandbox read-only "${model_args[@]}" "${reasoning_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
         else
-          rtk codex exec --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" || rc=$?
+          rtk codex exec --sandbox read-only "${model_args[@]}" "${reasoning_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
         fi
       else
         if is_system4u_profile; then
-          rtk codex exec -c 'approval_policy="never"' --sandbox workspace-write - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" || rc=$?
+          rtk codex exec -c 'approval_policy="never"' --sandbox workspace-write - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
         else
-          rtk codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" || rc=$?
+          rtk codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
         fi
       fi
     else
@@ -1011,12 +1065,12 @@ run_engine() {
           "${model_args[@]}" \
           -p "$(cat "$prompt_file")" \
           --allowedTools "Read,Glob,Grep" \
-          --output-format text < /dev/null 2>&1 | capture_engine_output "$log_file" || rc=$?
+          --output-format text < /dev/null 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
       else
         # JSON: o exit code do CLI e sinal fraco; o gate 0 le is_error.
         env -u CLAUDECODE claude --dangerously-skip-permissions \
           -p "$(cat "$prompt_file")" \
-          --output-format json < /dev/null 2>&1 | capture_engine_output "$log_file" || rc=$?
+          --output-format json < /dev/null 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
       fi
     fi
 
@@ -1070,6 +1124,28 @@ tree_signature() {
   } 2> /dev/null | sha256sum | cut -c1-16
 }
 
+# Paths de trabalho atuais, sem staging nem qualquer outra mutacao do index.
+# Inclui alteracoes rastreadas, staged (por exemplo, commit que falhou) e
+# arquivos nao rastreados.
+phase_changed_paths() {
+  {
+    git diff --name-only
+    git diff --cached --name-only
+    git ls-files --others --exclude-standard
+  } | sed '/^$/d' | sort -u
+}
+
+collect_phase_files() {
+  local paths
+  paths=$(phase_changed_paths)
+
+  if [ -z "$paths" ]; then
+    LAST_PHASE_FILES="nenhum"
+  else
+    LAST_PHASE_FILES=$(printf '%s\n' "$paths" | paste -sd ',' - | sed 's/,/, /g')
+  fi
+}
+
 # Gate 1 — esta sessao escreveu codigo?
 #
 # SINAL, nao veredito. Uma fase pode ja estar implementada antes da sessao
@@ -1119,6 +1195,11 @@ gate2_tests_pass() {
 # GATE3_RAN diz ao caminho "ja implementada" quais gates de fato validaram HEAD.
 GATE3_RAN=0
 
+set_gate3_red_result() {
+  local parsed="$1" expected="$2" incomplete="$3" cycle="$4" verify_log="$5"
+  LAST_VERIFY_RESULT="Gate 3 vermelho (cobertura: $parsed/$expected; incompletas: $incomplete) | ciclo: $cycle | log: $verify_log"
+}
+
 gate3_independent_verify() {
   local phase_file="$1" cycle="$2" session_wrote="$3"
   local verify_log="$LOG_DIR/${phase_file%.md}.verify-${cycle}.log"
@@ -1150,11 +1231,30 @@ gate3_independent_verify() {
   fi
 
   GATE3_RAN=1
-  log "Gate 3 — sessao verificadora independente ($expected tasks${VERIFY_MODEL:+, modelo: $VERIFY_MODEL})"
+  local requested_model requested_reasoning
+  requested_model="${VERIFY_MODEL:-herdado}"
+  if [ "$ENGINE" = "claude" ]; then
+    requested_reasoning="nao aplicavel"
+  else
+    requested_reasoning="${VERIFY_REASONING:-herdado}"
+  fi
+  log "Gate 3 — gravando | engine: $ENGINE | modelo: $requested_model | reasoning: $requested_reasoning | sandbox: read-only | log: $verify_log"
 
   local prompt_file
   prompt_file=$(build_verify_prompt "$phase_file" "$cycle")
   run_engine "$prompt_file" "$verify_log" verify || true
+
+  if [ ! -e "$verify_log" ]; then
+    GATE_CAUSE="Log de verificacao ausente: $verify_log. O Gate 3 nao pode aprovar sem evidencia do verificador."
+    set_gate3_red_result 0 "$expected" "indisponivel" "$cycle" "$verify_log"
+    return 1
+  fi
+
+  if [ ! -s "$verify_log" ]; then
+    GATE_CAUSE="Log de verificacao vazio: $verify_log. O Gate 3 nao pode aprovar sem evidencia do verificador."
+    set_gate3_red_result 0 "$expected" "indisponivel" "$cycle" "$verify_log"
+    return 1
+  fi
 
   local task_lines
   task_lines=$(
@@ -1190,11 +1290,16 @@ gate3_independent_verify() {
 
   if [ "$parsed" -eq 0 ]; then
     GATE_CAUSE="O verificador independente nao emitiu nenhuma linha 'TASK <n>: DONE|INCOMPLETE' — nao foi possivel confirmar que a fase esta completa. Ultimas linhas do verificador:"$'\n'"$(tail -n 40 "$verify_log")"
+    set_gate3_red_result 0 "$expected" "indisponivel" "$cycle" "$verify_log"
     return 1
   fi
 
+  local incomplete_count
+  incomplete_count=$(printf '%s\n' "$task_lines" | grep -c 'INCOMPLETE' || true)
+
   if [ "$parsed" -ne "$expected" ]; then
     GATE_CAUSE="O verificador cobriu $parsed de $expected tasks — cobertura incompleta. Linhas emitidas:"$'\n'"$task_lines"
+    set_gate3_red_result "$parsed" "$expected" "$incomplete_count" "$cycle" "$verify_log"
     return 1
   fi
 
@@ -1203,11 +1308,12 @@ gate3_independent_verify() {
 
   if [ -n "$incomplete" ]; then
     GATE_CAUSE="O verificador independente encontrou tasks incompletas:"$'\n'"$incomplete"
+    set_gate3_red_result "$parsed" "$expected" "$incomplete_count" "$cycle" "$verify_log"
     return 1
   fi
 
   success "Gate 3 — $parsed/$expected tasks confirmadas no codigo"
-  LAST_VERIFY_RESULT="Gate 3 verde ($parsed/$expected tasks)"
+  LAST_VERIFY_RESULT="Gate 3 verde ($parsed/$expected tasks) | ciclo: $cycle | log: $verify_log"
   return 0
 }
 
@@ -1341,6 +1447,7 @@ run_phase() {
       success "Phase $phase_num: $phase_title — COMPLETA ($(format_duration "$phase_duration"))"
       if ! commit_phase "$phase_num" "$phase_title"; then
         LAST_GATE="commit"
+        collect_phase_files
         record_phase_report "$phase_num" "$phase_title" "falhou" "$cycle" "$(format_duration "$phase_duration")" "$LAST_TEST_RESULT" "$LAST_VERIFY_RESULT" "$LAST_PHASE_COMMIT" "$LAST_PHASE_FILES" "$LAST_GATE"
         phase_summary "$phase_num" "$phase_title" "$seq" "$total" "falhou" "$(format_duration "$phase_duration")" "$cycle" "falha ao criar o commit" "$LOG_DIR/${phase_file%.md}.*"
         return 1
@@ -1355,6 +1462,7 @@ run_phase() {
   done
 
   local phase_duration=$(($(date +%s) - phase_start))
+  collect_phase_files
   record_phase_report "$phase_num" "$phase_title" "falhou" "$MAX_CYCLES" "$(format_duration "$phase_duration")" "$LAST_TEST_RESULT" "$LAST_VERIFY_RESULT" "$LAST_PHASE_COMMIT" "$LAST_PHASE_FILES" "$LAST_GATE"
   phase_summary "$phase_num" "$phase_title" "$seq" "$total" "falhou" "$(format_duration "$phase_duration")" "$MAX_CYCLES" "$LAST_GATE" "$LOG_DIR/${phase_file%.md}.*"
   fail "Phase $phase_num: $phase_title — FALHOU apos $MAX_CYCLES ciclos ($(format_duration "$phase_duration"))"
