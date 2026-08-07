@@ -144,7 +144,7 @@ Reads a phase document, splits it on the `## Phase N: <title>` heading, and feed
 
 With no argument, the input resolves in this order: `.spec/init/project-phases.md` → `.spec/project-phases.md` (pre-init layout, with a warning). A feature `PHASES.md` is also valid input.
 
-> **Autonomy and permissions note**: ralph is an unattended orchestrator by design. With the Claude engine, implementation sessions run with `--dangerously-skip-permissions` — the agent can edit files and run commands in the repository without prompting. Run it only in repositories you trust, ideally in a disposable branch or isolated environment (container/VM). Every phase lands as a separate commit, so `git revert`/`git reset` always gets you back. The verification session (gate 3) is restricted to read-only tools (`Read,Glob,Grep`).
+> **Autonomy and permissions note**: ralph is an unattended orchestrator by design. With the Claude engine, implementation sessions run with `--dangerously-skip-permissions` — the agent can edit files and run commands in the repository without prompting. Run it only in repositories you trust, ideally in a disposable branch or isolated environment (container/VM). Every green phase lands as a separate commit, allowing only the corresponding work to be reverted. The Gate 3 verification session remains restricted to read-only tools (`Read,Glob,Grep`).
 
 ### `system4u-autonomous` profile
 
@@ -178,9 +178,27 @@ The allowlist is line-based: exact files or directory prefixes ending in `/`; bl
 | 2 | Does the test suite pass? | Run **by ralph itself**, outside the agent session — the agent cannot "fake green" |
 | 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); on the claude engine it uses a cheap model (haiku) |
 
-Any red gate → **fix cycle**: a fresh session receives the full phase + the real failure cause (never a generic "tests failed"). Default: 3 cycles per phase.
+Any red gate → **fix cycle**: a fresh session receives the full phase + the real failure cause (never a generic "tests failed"). The default hard cap is **12 total cycles per phase**, including the initial implementation; `--max-cycles` or `RALPH_MAX_CYCLES` set a different explicit limit.
+
+The first failure is the progress reference. A consecutive repetition of the same gate + normalized cause + tree signature increments stagnation; a different gate, finding, or tree resets the counter. The default `--max-stalled-cycles 2` stops after two consecutive corrective repetitions without progress. A phase therefore ends green, at the hard cap, on stagnation, or because an operational/guardrail/commit failure could not be corrected within those limits; preflight failures abort before the first session.
+
+Usage limits are handled separately: ralph waits for the reset and re-runs the same numbered session without consuming a fix cycle. To avoid waiting forever, `RALPH_MAX_LIMIT_WAITS` caps consecutive waits per phase (default: 20).
 
 Green gates with a clean tree → the phase was already implemented at HEAD: marked done, no commit.
+
+### Gate 3 configuration, runtime, and logs
+
+Verifier model and reasoning follow **flag > environment variable > inherited engine configuration** precedence. For Codex, reasoning accepts `minimal`, `low`, `medium`, `high`, or `xhigh` and is passed as `model_reasoning_effort`; without an override, model and reasoning are inherited. For Claude, the model default remains `haiku`, and any reasoning override fails at preflight because it is not applicable.
+
+Before each verification, the terminal records `gravando` (recording), engine, requested model/reasoning (or `herdado`/inherited and `nao aplicavel`/not applicable), the `read-only` sandbox, and the log path. This is the **requested configuration**. For Codex, the header emitted by the CLI reveals the **effective runtime**; its model and reasoning lines are mirrored to the terminal even with `--quiet`, while the complete header remains in the log.
+
+Artifacts are separated by phase and cycle under `.phases/logs/` by default, or `<run-dir>/logs/` with `system4u-autonomous`: `phase-NN.cycle-C.log` for implementation/fixes, `phase-NN.test-C.log` for Gate 2, and `phase-NN.verify-C.log` for Gate 3. Every Gate 3 run requires an existing, non-empty verification log; a missing or empty file leaves the gate red with an explicit operational cause and the corresponding path in the summary.
+
+### Functional versus operational authorization
+
+An **application-level** authentication, authorization, isolation, policy, gate, or permission finding is fixable without pausing when it appears in the approved phase text or gate cause; the fix cycle must implement and test that functional requirement.
+
+This does not expand the agent's operational authorization. Project rules, sandbox, allowlist, file boundaries, and prohibitions on reading secrets, unauthorized external calls, destructive migrations, deploy, push, merge, tag, and release still apply.
 
 ### Test command detection (gate 2)
 
@@ -195,25 +213,32 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 | `--engine codex\|claude` | Implementation engine (default: `codex`) |
 | `--from N` | Starts at phase N (clears progress for phases ≥ N) |
 | `--keep-going` | Continues after a phase fails (creates a `wip(phase-N)` commit; default: stop) |
-| `--max-cycles N` | Fix cycles per phase (default: 3) |
+| `--max-cycles N` | Total hard cap per phase, including the initial implementation (default: 12) |
+| `--max-stalled-cycles N` | Consecutive corrective repetitions without progress after the first reference failure (default: 2) |
+| `--verify-model MODEL` | Gate 3 model; takes precedence over `RALPH_VERIFY_MODEL` |
+| `--verify-reasoning EFFORT` | Codex Gate 3 reasoning (`minimal\|low\|medium\|high\|xhigh`); takes precedence over `RALPH_VERIFY_REASONING` |
 | `--test-cmd "<cmd>"` | Project test command (gate 2) |
 | `--no-verify` | Disables gate 3 |
-| `-q`, `--quiet` | Hides raw Codex/Claude output from the terminal and prints a summary when each phase ends; full logs remain in `.phases/logs/` |
+| `-q`, `--quiet` | Hides raw Codex/Claude output from the terminal and prints a summary when each phase ends; full logs remain in the active artifact log directory |
 | `--profile system4u-autonomous` | Guarded non-interactive Codex profile: workspace-write, explicit allowlist, no WIP commits or destructive cleanup |
 | `--allowed-paths-file <path>` | Required repository-relative allowlist for `system4u-autonomous` |
 | `--run-dir <path>` | Fresh local artifact directory for `system4u-autonomous` (default: `.ralph-system4u`) |
+| `-h`, `--help` | Prints the complete operational contract and exits |
 
 | Variable | Effect |
 |---|---|
 | `RALPH_TEST_CMD` | Test command (gate 2) |
 | `RALPH_VERIFY` | Gate 3: `always` (default) \| `auto` (saves tokens: only when gate 2's verdict isn't enough) \| `off` |
-| `RALPH_VERIFY_MODEL` | Verifier model (claude default: `haiku`) |
-| `RALPH_MAX_CYCLES` | Fix cycles per phase (default: 3) |
+| `RALPH_VERIFY_MODEL` | Verifier model (Claude default: `haiku`; inherited in Codex) |
+| `RALPH_VERIFY_REASONING` | Codex verifier reasoning; not applicable to Claude |
+| `RALPH_MAX_CYCLES` | Total hard cap per phase (default: 12) |
+| `RALPH_MAX_STALLED_CYCLES` | Consecutive corrective repetitions without progress (default: 2) |
+| `RALPH_QUIET` | `true` or `false` (default: `false`) |
 | `RALPH_MAX_LIMIT_WAITS` | Consecutive usage-limit waits, per phase (default: 20) |
 | `RALPH_LIMIT_WAIT_DEFAULT` | Fallback wait in seconds (default: 1800) |
 | `RALPH_LIMIT_BUFFER` | Extra seconds after the reset (default: 60) |
 
-During each session, ralph exports `RALPH_ENGINE`, `RALPH_PHASE_TITLE`, `RALPH_PHASE_NUM`, `RALPH_PHASE_TOTAL`, `RALPH_PHASE_ATTEMPT`, and `RALPH_PHASE_MAX_ATTEMPTS` — useful for notification hooks (e.g. n8n).
+During each session, ralph exports `RALPH_ENGINE`, `RALPH_PHASE_TITLE`, `RALPH_PHASE_NUM`, `RALPH_PHASE_TOTAL`, `RALPH_PHASE_ATTEMPT`, and `RALPH_PHASE_MAX_ATTEMPTS` — useful for notification hooks (e.g. n8n). `RALPH_PHASE_ATTEMPT=1` identifies the initial implementation; usage-limit retries preserve the same value. `RALPH_PHASE_MAX_ATTEMPTS` contains the effective hard cap resolved from flag/env/default.
 
 ### State and progress
 

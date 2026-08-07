@@ -35,6 +35,7 @@
 #   --profile NAME           perfil de execucao (default | system4u-autonomous)
 #   --allowed-paths-file P   allowlist obrigatoria no perfil system4u-autonomous
 #   --run-dir P              diretorio de artefatos do perfil system4u-autonomous
+#   -h, --help               exibe este contrato operacional e sai
 #
 # Input (primeiro arquivo posicional). Sem argumento, resolve nesta ordem:
 #   1. .spec/init/project-phases.md      (cadeia init)
@@ -63,6 +64,33 @@
 #      claude o verificador usa um modelo barato (RALPH_VERIFY_MODEL, default:
 #      haiku) — e leitura + checklist.
 #
+# Configuracao e runtime do Gate 3:
+#   - --verify-model/--verify-reasoning prevalecem sobre as variaveis de
+#     ambiente; sem valor configurado, o Codex herda modelo/reasoning.
+#   - Claude usa haiku por default e nao aceita override de reasoning.
+#   - Antes da verificacao, o terminal informa a configuracao solicitada,
+#     sandbox read-only e log. No Codex, o cabecalho emitido pelo CLI e o
+#     runtime efetivo: modelo/reasoning ficam no log e aparecem ate em --quiet.
+#   - Cada tentativa exige phase-NN.verify-C.log nao vazio; ausencia ou log
+#     vazio deixa o Gate 3 vermelho por falha operacional.
+#
+# Remediacao e causas de parada:
+#   - MAX_CYCLES e o hard cap total, incluindo a implementacao inicial
+#     (default: 12). Gate vermelho abre uma nova sessao corretiva.
+#   - A primeira falha vira referencia. Repetir gate + causa normalizada +
+#     arvore sem mudanca incrementa estagnacao; finding, gate ou arvore novos
+#     zeram o contador. Default: 2 repeticoes corretivas consecutivas.
+#   - A fase termina verde, por hard cap, por estagnacao, por guardrail/falha
+#     operacional que nao foi corrigido dentro desses limites, ou por falha de
+#     commit. Falhas de preflight abortam antes da primeira sessao.
+#   - Limite de uso nao consome ciclo: espera e repete a mesma sessao numerada.
+#     O run aborta apos RALPH_MAX_LIMIT_WAITS esperas consecutivas.
+#
+# Findings de autenticacao, autorizacao, isolamento ou permissoes da aplicacao
+# citados na fase ou na causa do gate sao corrigiveis dentro do escopo aprovado.
+# Isso nao amplia permissoes operacionais: sandbox, allowlist, segredos, rede,
+# migrations destrutivas, deploy, push e escopo de arquivos continuam limitados.
+#
 # Gates verdes com a arvore limpa => a fase ja estava implementada em HEAD:
 # marcada como feita, sem commit (nao ha o que commitar).
 #
@@ -90,6 +118,7 @@
 #   RALPH_VERIFY_REASONING   reasoning do verificador Codex
 #   RALPH_MAX_CYCLES         hard cap total de ciclos por fase (default: 12)
 #   RALPH_MAX_STALLED_CYCLES ciclos corretivos sem progresso (default: 2)
+#   RALPH_QUIET              true | false (default: false)
 #   RALPH_MAX_LIMIT_WAITS    esperas consecutivas por limite, por fase (default: 20)
 #   RALPH_LIMIT_WAIT_DEFAULT fallback de espera em segundos (default: 1800)
 #   RALPH_LIMIT_BUFFER       segundos extras apos o reset (default: 60)
@@ -108,6 +137,7 @@
 #   - Codex: rtk + npm install -g @openai/codex + OPENAI_API_KEY
 #   - Claude: npm install -g @anthropic-ai/claude-code + ANTHROPIC_API_KEY
 #   - Raiz de um repo git, com a arvore de trabalho limpa
+# Fim do help
 
 set -euo pipefail
 
@@ -156,7 +186,7 @@ while [[ $# -gt 0 ]]; do
     --allowed-paths-file=*) ALLOWED_PATHS_FILE="${1#*=}"; shift ;;
     --run-dir)     RUN_DIR_FLAG="$2"; shift 2 ;;
     --run-dir=*)   RUN_DIR_FLAG="${1#*=}"; shift ;;
-    -h|--help)     sed -n '2,70p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,/^# Fim do help$/p' "$0" | sed '$d'; exit 0 ;;
     *)             INPUT_FILE="$1"; INPUT_FILE_EXPLICIT=true; shift ;;
   esac
 done

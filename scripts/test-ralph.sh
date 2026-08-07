@@ -33,12 +33,12 @@ assert_eq() {
 
 assert_contains() {
   local haystack_file="$1" needle="$2" msg="$3"
-  if grep -qF "$needle" "$haystack_file"; then ok "$msg"; else bad "$msg (nao achou '$needle')"; fi
+  if grep -qF -- "$needle" "$haystack_file"; then ok "$msg"; else bad "$msg (nao achou '$needle')"; fi
 }
 
 assert_not_contains() {
   local haystack_file="$1" needle="$2" msg="$3"
-  if grep -qF "$needle" "$haystack_file"; then bad "$msg (achou '$needle')"; else ok "$msg"; fi
+  if grep -qF -- "$needle" "$haystack_file"; then bad "$msg (achou '$needle')"; else ok "$msg"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1177,6 +1177,26 @@ if case_enabled laravel-no-sail; then
   run_ralph "$d" empty-diff --engine claude --max-cycles 1 > /dev/null
   assert_contains "$d/out.log" "comando de teste (detectado): composer test" "sem sail -> composer test"
   assert_not_contains "$d/out.log" "Sail" "nao mencionou Sail"
+fi
+
+# ---------------------------------------------------------------------------
+# 34. --help publica o contrato operacional completo. O marcador no cabecalho
+#     impede que novas linhas cortem silenciosamente variaveis ou exports.
+# ---------------------------------------------------------------------------
+if case_enabled help-contract; then
+  header "34. help publica defaults, runtime, paradas e exports"
+  help_log="$TMP/help-contract.log"
+  bash "$RALPH" --help > "$help_log"
+  assert_contains "$help_log" "--max-cycles N           hard cap total de ciclos por fase (default: 12)" "help informa hard cap default 12"
+  assert_contains "$help_log" "--max-stalled-cycles N   ciclos corretivos sem progresso (default: 2)" "help informa estagnacao default 2"
+  assert_contains "$help_log" "--verify-model/--verify-reasoning prevalecem" "help documenta precedencia da configuracao"
+  assert_contains "$help_log" "runtime efetivo: modelo/reasoning ficam no log" "help distingue runtime efetivo"
+  assert_contains "$help_log" "phase-NN.verify-C.log nao vazio" "help documenta log obrigatorio do Gate 3"
+  assert_contains "$help_log" "Limite de uso nao consome ciclo" "help preserva semantica de usage limit"
+  assert_contains "$help_log" "RALPH_VERIFY_REASONING" "help lista env de reasoning"
+  assert_contains "$help_log" "RALPH_MAX_STALLED_CYCLES" "help lista env de estagnacao"
+  assert_contains "$help_log" "RALPH_PHASE_MAX_ATTEMPTS igual a RALPH_MAX_CYCLES" "help lista export do hard cap efetivo"
+  assert_contains "$help_log" "Isso nao amplia permissoes operacionais" "help separa autorizacao funcional e operacional"
 fi
 
 # ---------------------------------------------------------------------------
