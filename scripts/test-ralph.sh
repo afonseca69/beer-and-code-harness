@@ -83,6 +83,7 @@ if [ "$name" = "claude" ]; then
     esac
   done
 else
+  printf '%s\n' "$@" >> "$state/codex_args"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sandbox) [ "$2" = "read-only" ] && verify=1; shift 2 ;;
@@ -118,6 +119,9 @@ if [ "$verify" -eq 1 ]; then
   if [ "$scenario" = "verify-incomplete-once" ] && [ "$n" -eq 1 ]; then
     echo "TASK 1: INCOMPLETE — o arquivo nao foi criado"
     for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
+  elif [ "$scenario" = "verify-duplicate" ]; then
+    for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
+    for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
   else
     for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
   fi
@@ -172,6 +176,22 @@ MOCK
   chmod +x "$bin/mock-engine"
   cp "$bin/mock-engine" "$bin/claude"
   cp "$bin/mock-engine" "$bin/codex"
+
+  cat > "$bin/rtk" <<'RTK'
+#!/usr/bin/env bash
+set -euo pipefail
+
+state="${MOCK_STATE:?}"
+[ "${1:-}" = "codex" ] || exit 64
+shift
+
+count=0
+[ -f "$state/rtk_calls" ] && count=$(cat "$state/rtk_calls")
+echo $((count + 1)) > "$state/rtk_calls"
+
+exec "$(dirname "$0")/codex" "$@"
+RTK
+  chmod +x "$bin/rtk"
 }
 
 make_testcmd() {
@@ -319,6 +339,12 @@ if case_enabled ok-first; then
   assert_eq "feat(phase-2): Feature" "$(git -C "$d/repo" log -1 --pretty=%s)" "mensagem de commit da ultima fase"
   assert_eq 2 "$(cat "$d/state/impl_calls")" "1 sessao de implementacao por fase (2 fases)"
   assert_eq 2 "$(cat "$d/state/verify_calls")" "gate 3 (default always) rodou em toda fase"
+  assert_contains "$d/out.log" "RESUMO DE ENTREGA" "relatorio final inclui resumo consolidado"
+  assert_contains "$d/out.log" "testes: Gate 2 verde" "resumo registra a validacao da suite"
+  assert_contains "$d/out.log" "verificacao: Gate 3 verde (2/2 tasks)" "resumo registra a verificacao independente"
+  assert_contains "$d/out.log" "commit: " "resumo registra o commit da fase"
+  assert_contains "$d/out.log" "arquivos: src/impl-1.txt" "resumo registra os arquivos do commit"
+  assert_contains "$d/out.log" "Pendencias do run: nenhuma." "resumo declara ausencia de pendencias"
 fi
 
 # ---------------------------------------------------------------------------
@@ -368,6 +394,47 @@ if case_enabled verify-incomplete; then
   assert_contains "$d/out.log" "Gate 3 vermelho" "gate 3 reportado vermelho"
   assert_contains "$d/repo/.phases/prompts/phase-01.cycle-2.txt" "TASK 1: INCOMPLETE" "prompt de correcao carrega as tasks incompletas verbatim"
   test -f "$d/repo/.phases/logs/phase-01.verify-1.log" && ok "log do verificador por ciclo" || bad "log do verificador por ciclo"
+fi
+
+# ---------------------------------------------------------------------------
+# 4b. Codex pode repetir a resposta final no stream combinado. O Gate 3
+#     consolida pelo numero da task antes de validar a cobertura.
+# ---------------------------------------------------------------------------
+if case_enabled verify-duplicate; then
+  header "4b. verificador duplicado e consolidado por task"
+  d=$(new_case verify-duplicate)
+  rc=$(run_ralph "$d" verify-duplicate --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 3 "$(commits "$d")" "fases commitadas com uma linha efetiva por task"
+  assert_contains "$d/out.log" "Gate 3 — 2/2 tasks confirmadas no codigo" "cobertura usa tasks unicas"
+  assert_not_contains "$d/out.log" "cobertura incompleta" "duplicacao nao gera falso negativo"
+fi
+
+# ---------------------------------------------------------------------------
+# 4c. Gate 3 com 11+ tasks nao pode filtrar lexicograficamente apenas
+#     TASK 1, 10 e 11.
+# ---------------------------------------------------------------------------
+if case_enabled verify-eleven-tasks; then
+  header "4c. gate 3 confirma 11/11 tasks"
+  d=$(new_case verify-eleven-tasks)
+  (
+    cd "$d/repo" || exit 1
+    {
+      printf '# Test Project — Project Phases\n\n'
+      printf '<!-- inputs: project-description.md@sha256:000000000000 -->\n\n'
+      printf '## Phase 1: Eleven Tasks\n\n'
+      for i in $(seq 1 11); do
+        printf -- '- [ ] **Task:** item %s\n' "$i"
+        printf '  - **Acceptance criteria:**\n'
+        printf '    - item %s existe\n' "$i"
+      done
+    } > .spec/init/project-phases.md
+    git add -A && git commit -q -m "chore: fixture com 11 tasks"
+  )
+  rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "Gate 3 — 11/11 tasks confirmadas no codigo" "gate 3 confirmou todas as 11 tasks"
+  assert_not_contains "$d/out.log" "cobertura incompleta" "nao reportou cobertura incompleta"
 fi
 
 # ---------------------------------------------------------------------------
@@ -515,6 +582,95 @@ if case_enabled already-done; then
   assert_eq "$before" "$(commits "$d")" "nenhum commit criado (nada a commitar)"
   assert_contains "$d/repo/.phases/.progress" "phase-01.md" "progresso registra a fase"
   assert_contains "$d/repo/.phases/.progress" "phase-02.md" "progresso registra a fase seguinte"
+fi
+
+# ---------------------------------------------------------------------------
+# 22. --quiet oculta o output dos engines, preserva os logs e mostra resumo
+#     para cada fase concluida.
+# ---------------------------------------------------------------------------
+if case_enabled quiet; then
+  header "22. --quiet preserva logs e resume cada fase"
+  d=$(new_case quiet)
+  rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --quiet)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "[resumo] Fase 1/2: Foundation" "resumo da primeira fase"
+  assert_contains "$d/out.log" "[resumo] Fase 2/2: Feature" "resumo da segunda fase"
+  assert_not_contains "$d/out.log" '"result":"implementado"' "output bruto do engine nao aparece no terminal"
+  assert_contains "$d/repo/.phases/logs/phase-01.cycle-1.log" '"result":"implementado"' "output bruto do engine fica no log"
+fi
+
+# ---------------------------------------------------------------------------
+# 23. Engine Codex sempre passa pelo RTK, tanto na implementacao quanto na
+#     verificacao independente.
+# ---------------------------------------------------------------------------
+if case_enabled rtk-codex; then
+  header "23. engine codex passa por rtk codex"
+  d=$(new_case rtk-codex)
+  rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 4 "$(cat "$d/state/rtk_calls")" "rtk envolveu implementacao e verificacao das duas fases"
+fi
+
+# ---------------------------------------------------------------------------
+# 24. Perfil System4u: Codex e autonomo em workspace-write, com allowlist e
+#     sem danger-full-access. O commit continua limitado aos paths declarados.
+# ---------------------------------------------------------------------------
+if case_enabled system4u-autonomous; then
+  header "24. perfil system4u-autonomous"
+  d=$(new_case system4u-autonomous)
+  (
+    cd "$d/repo" || exit 1
+    git branch -M feature/ralph-autonomous
+    mkdir -p controls
+    printf 'src/\n' > controls/allowed-paths.txt
+    git add -A
+    git commit -q -m "chore: allowlist"
+  )
+  rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh" --profile system4u-autonomous --allowed-paths-file controls/allowed-paths.txt .spec/init/project-phases.md)
+  assert_eq 0 "$rc" "exit 0"
+  assert_eq 4 "$(cat "$d/state/rtk_calls")" "rtk envolve implementacao e verificacao"
+  assert_contains "$d/state/codex_args" 'approval_policy="never"' "Codex executa sem perguntas dentro da fase"
+  assert_contains "$d/state/codex_args" "workspace-write" "implementacao usa workspace-write"
+  assert_not_contains "$d/state/codex_args" "danger-full-access" "perfil nao usa danger-full-access"
+  assert_eq 4 "$(commits "$d")" "duas fases commitadas apenas com paths permitidos"
+
+  d2=$(new_case system4u-blocked-path)
+  (
+    cd "$d2/repo" || exit 1
+    git branch -M feature/ralph-autonomous
+    mkdir -p controls
+    printf 'docs/\n' > controls/allowed-paths.txt
+    git add -A
+    git commit -q -m "chore: restrictive allowlist"
+  )
+  rc=$(run_ralph "$d2" ok --engine codex --test-cmd "$d2/test.sh" --profile system4u-autonomous --allowed-paths-file controls/allowed-paths.txt --max-cycles 1 .spec/init/project-phases.md)
+  assert_eq 1 "$rc" "path fora da allowlist reprova a fase"
+  assert_contains "$d2/out.log" "Guardrail System4u vermelho" "bloqueio da allowlist reportado"
+  assert_eq 2 "$(commits "$d2")" "nenhum commit de fase para path bloqueado"
+
+  d3=$(new_case system4u-main-branch)
+  (
+    cd "$d3/repo" || exit 1
+    git branch -M main
+    mkdir -p controls
+    printf 'src/\n' > controls/allowed-paths.txt
+    git add -A
+    git commit -q -m "chore: allowlist"
+  )
+  rc=$(run_ralph "$d3" ok --engine codex --test-cmd "$d3/test.sh" --profile system4u-autonomous --allowed-paths-file controls/allowed-paths.txt .spec/init/project-phases.md)
+  assert_eq 1 "$rc" "main e bloqueada antes do engine"
+  assert_contains "$d3/out.log" "na branch main" "bloqueio da branch main reportado"
+  test -f "$d3/state/impl_calls" && bad "main nao inicia sessao de engine" || ok "main nao inicia sessao de engine"
+
+  d4=$(new_case system4u-missing-allowlist)
+  (
+    cd "$d4/repo" || exit 1
+    git branch -M feature/ralph-autonomous
+  )
+  rc=$(run_ralph "$d4" ok --engine codex --test-cmd "$d4/test.sh" --profile system4u-autonomous .spec/init/project-phases.md)
+  assert_eq 1 "$rc" "allowlist e obrigatoria"
+  assert_contains "$d4/out.log" "exige --allowed-paths-file" "erro da allowlist ausente reportado"
+  test -f "$d4/state/impl_calls" && bad "allowlist ausente nao inicia sessao de engine" || ok "allowlist ausente nao inicia sessao de engine"
 fi
 
 # ---------------------------------------------------------------------------

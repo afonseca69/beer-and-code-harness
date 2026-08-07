@@ -48,7 +48,7 @@ O `ralph.sh` é um script bash independente — copie ou referencie `scripts/ral
 
 **Pré-requisitos do ralph.sh:**
 
-- Engine Codex: `npm install -g @openai/codex` + `OPENAI_API_KEY`
+- Engine Codex: `rtk` + `npm install -g @openai/codex` + `OPENAI_API_KEY` (o ralph executa `rtk codex exec`)
 - Engine Claude: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
 - Raiz de um repositório git com árvore de trabalho **limpa**
 
@@ -142,6 +142,21 @@ Lê um documento de fases, quebra pelo heading `## Phase N: <título>` e aliment
 
 Sem argumento, resolve o input nesta ordem: `.spec/init/project-phases.md` → `.spec/project-phases.md` (layout pré-init, com aviso). Um `PHASES.md` de feature também é input válido.
 
+### Perfil `system4u-autonomous`
+
+Este perfil opt-in do Codex é destinado a execuções autônomas protegidas do System4u Portal. Ele não pede confirmações, mas **não** é YOLO irrestrito: a implementação usa `rtk codex exec -c 'approval_policy="never"' --sandbox workspace-write`, e a verificação continua somente-leitura.
+
+Ele exige branch limpa e diferente de `main`, documento de fases explícito, `RALPH_VERIFY=always`, diretório novo de artefatos locais e uma allowlist relativa ao repositório. Rejeita exclusões, renomeações, `.env`, `.git`, `storage/`, `vendor/` e `node_modules/`; nunca faz push, merge, deploy, instala dependências ou roda migrations. As fases completas só recebem commit depois que os paths alterados passam pela allowlist.
+
+```bash
+scripts/ralph.sh --engine codex --profile system4u-autonomous --quiet \
+  --allowed-paths-file controls/approved-paths.txt \
+  --run-dir .ralph-system4u-20260728 \
+  docs/approved-phases.md
+```
+
+A allowlist é baseada em linhas: arquivos exatos ou prefixos de diretório terminados em `/`; linhas vazias e comentários `#` são ignorados. Ela deve estar commitada antes da execução e não pode incluir glob, traversal, segredos, metadados Git ou diretórios gerados/de runtime.
+
 ### Invariantes
 
 1. Cada fase **e** cada ciclo de correção roda em sessão nova, com prompt auto-contido. Nunca reutiliza sessão.
@@ -179,6 +194,10 @@ Projeto Laravel Sail: a suite roda **dentro do container** (`vendor/bin/sail tes
 | `--max-cycles N` | Ciclos de correção por fase (default: 3) |
 | `--test-cmd "<cmd>"` | Comando de teste do projeto (gate 2) |
 | `--no-verify` | Desliga o gate 3 |
+| `-q`, `--quiet` | Oculta o output bruto do Codex/Claude no terminal e imprime um resumo ao concluir cada fase; os logs completos continuam em `.phases/logs/` |
+| `--profile system4u-autonomous` | Perfil Codex autônomo protegido: workspace-write, allowlist explícita, sem commits WIP nem limpeza destrutiva |
+| `--allowed-paths-file <path>` | Allowlist relativa ao repositório obrigatória no `system4u-autonomous` |
+| `--run-dir <path>` | Diretório local novo de artefatos do `system4u-autonomous` (padrão: `.ralph-system4u`) |
 
 | Variável | Efeito |
 |---|---|

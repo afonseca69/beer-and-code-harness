@@ -3,7 +3,7 @@
 # ralph.sh
 #
 # Orquestrador que le um documento de fases, quebra em fases, e alimenta cada
-# uma ao Codex CLI ou Claude Code para implementacao automatica.
+# uma ao RTK + Codex CLI ou Claude Code para implementacao automatica.
 #
 # Invariantes:
 #   1. Cada fase E cada ciclo de correcao roda em sessao NOVA, com prompt
@@ -28,6 +28,10 @@
 #   --max-cycles N           ciclos de correcao por fase (default: 3)
 #   --no-verify              desliga o gate 3 (equivale a RALPH_VERIFY=off)
 #   --test-cmd "<cmd>"       comando de teste do projeto (gate 2)
+#   -q, --quiet              oculta o output dos engines; exibe um resumo por fase
+#   --profile NAME           perfil de execucao (default | system4u-autonomous)
+#   --allowed-paths-file P   allowlist obrigatoria no perfil system4u-autonomous
+#   --run-dir P              diretorio de artefatos do perfil system4u-autonomous
 #
 # Input (primeiro arquivo posicional). Sem argumento, resolve nesta ordem:
 #   1. .spec/init/project-phases.md      (cadeia init)
@@ -96,7 +100,7 @@
 # Exit code: 0 = todas as fases verdes; 1 = alguma falhou ou abortou.
 #
 # Pre-requisitos:
-#   - Codex: npm install -g @openai/codex + OPENAI_API_KEY
+#   - Codex: rtk + npm install -g @openai/codex + OPENAI_API_KEY
 #   - Claude: npm install -g @anthropic-ai/claude-code + ANTHROPIC_API_KEY
 #   - Raiz de um repo git, com a arvore de trabalho limpa
 
@@ -110,6 +114,11 @@ TEST_CMD_FLAG=""
 MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
 VERIFY_MODEL=""
+QUIET="${RALPH_QUIET:-false}"
+PROFILE="default"
+ALLOWED_PATHS_FILE=""
+RUN_DIR_FLAG=""
+INPUT_FILE_EXPLICIT=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -123,16 +132,28 @@ while [[ $# -gt 0 ]]; do
     --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
     --keep-going)  KEEP_GOING=true; shift ;;
     --no-verify)   VERIFY_MODE="off"; shift ;;
+    -q|--quiet)    QUIET=true; shift ;;
+    --profile)     PROFILE="$2"; shift 2 ;;
+    --profile=*)   PROFILE="${1#*=}"; shift ;;
+    --allowed-paths-file)   ALLOWED_PATHS_FILE="$2"; shift 2 ;;
+    --allowed-paths-file=*) ALLOWED_PATHS_FILE="${1#*=}"; shift ;;
+    --run-dir)     RUN_DIR_FLAG="$2"; shift 2 ;;
+    --run-dir=*)   RUN_DIR_FLAG="${1#*=}"; shift ;;
     -h|--help)     sed -n '2,70p' "$0"; exit 0 ;;
-    *)             INPUT_FILE="$1"; shift ;;
+    *)             INPUT_FILE="$1"; INPUT_FILE_EXPLICIT=true; shift ;;
   esac
 done
 
-PHASES_DIR=".phases"
-LOG_DIR=".phases/logs"
-PROMPT_DIR=".phases/prompts"
+if [ "$PROFILE" = "system4u-autonomous" ]; then
+  PHASES_DIR="${RUN_DIR_FLAG:-.ralph-system4u}"
+else
+  PHASES_DIR=".phases"
+fi
 MANIFEST="$PHASES_DIR/manifest.txt"
 PROGRESS_FILE="$PHASES_DIR/.progress"
+
+LOG_DIR="$PHASES_DIR/logs"
+PROMPT_DIR="$PHASES_DIR/prompts"
 
 MAX_LIMIT_WAITS="${RALPH_MAX_LIMIT_WAITS:-20}"
 LIMIT_WAIT_DEFAULT="${RALPH_LIMIT_WAIT_DEFAULT:-1800}"
@@ -153,6 +174,10 @@ success() { echo -e "${GREEN}[$(date '+%H:%M:%S')] $1${NC}"; }
 warn()    { echo -e "${YELLOW}[$(date '+%H:%M:%S')] $1${NC}"; }
 fail()    { echo -e "${RED}[$(date '+%H:%M:%S')] $1${NC}"; }
 
+is_system4u_profile() {
+  [ "$PROFILE" = "system4u-autonomous" ]
+}
+
 format_duration() {
   local total_seconds=$1
   local hours=$((total_seconds / 3600))
@@ -166,6 +191,64 @@ format_duration() {
   else
     printf "%ds" "$seconds"
   fi
+}
+
+phase_summary() {
+  [ "$QUIET" = true ] || return 0
+
+  local phase_num="$1" phase_title="$2" sequence="$3" total="$4" status="$5"
+  local duration="$6" cycles="$7" detail="$8" log_glob="$9"
+
+  printf '\n%s[resumo] Fase %s/%s: %s%s\n' "$BLUE" "$sequence" "$total" "$phase_title" "$NC"
+  printf '  status: %s | ciclos: %s | duracao: %s\n' "$status" "$cycles" "$duration"
+  printf '  detalhe: %s\n' "$detail"
+  printf '  logs: %s\n' "$log_glob"
+}
+
+PHASE_REPORT_NUMBERS=()
+PHASE_REPORT_TITLES=()
+PHASE_REPORT_STATUSES=()
+PHASE_REPORT_CYCLES=()
+PHASE_REPORT_DURATIONS=()
+PHASE_REPORT_TESTS=()
+PHASE_REPORT_VERIFICATIONS=()
+PHASE_REPORT_COMMITS=()
+PHASE_REPORT_FILES=()
+PHASE_REPORT_PENDING=()
+
+record_phase_report() {
+  PHASE_REPORT_NUMBERS+=("$1")
+  PHASE_REPORT_TITLES+=("$2")
+  PHASE_REPORT_STATUSES+=("$3")
+  PHASE_REPORT_CYCLES+=("$4")
+  PHASE_REPORT_DURATIONS+=("$5")
+  PHASE_REPORT_TESTS+=("$6")
+  PHASE_REPORT_VERIFICATIONS+=("$7")
+  PHASE_REPORT_COMMITS+=("$8")
+  PHASE_REPORT_FILES+=("$9")
+  PHASE_REPORT_PENDING+=("${10}")
+}
+
+print_delivery_summary() {
+  local index
+
+  echo ""
+  log "RESUMO DE ENTREGA"
+
+  if [ "${#PHASE_REPORT_NUMBERS[@]}" -eq 0 ]; then
+    log "Nenhuma fase foi executada neste run."
+    return 0
+  fi
+
+  for index in "${!PHASE_REPORT_NUMBERS[@]}"; do
+    printf '  Fase %s — %s\n' "${PHASE_REPORT_NUMBERS[$index]}" "${PHASE_REPORT_TITLES[$index]}"
+    printf '    status: %s | ciclos: %s | duracao: %s\n' "${PHASE_REPORT_STATUSES[$index]}" "${PHASE_REPORT_CYCLES[$index]}" "${PHASE_REPORT_DURATIONS[$index]}"
+    printf '    testes: %s\n' "${PHASE_REPORT_TESTS[$index]}"
+    printf '    verificacao: %s\n' "${PHASE_REPORT_VERIFICATIONS[$index]}"
+    printf '    commit: %s\n' "${PHASE_REPORT_COMMITS[$index]}"
+    printf '    arquivos: %s\n' "${PHASE_REPORT_FILES[$index]}"
+    printf '    pendencia/gate: %s\n' "${PHASE_REPORT_PENDING[$index]}"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -213,12 +296,133 @@ validate_input_format() {
 
 exclude_phases_dir() {
   local exclude_file
+  local exclude_entry
   exclude_file="$(git rev-parse --git-dir)/info/exclude"
+  exclude_entry="/${PHASES_DIR#./}/"
   mkdir -p "$(dirname "$exclude_file")"
-  if ! grep -qxF '/.phases/' "$exclude_file" 2>/dev/null; then
-    echo '/.phases/' >> "$exclude_file"
-    log "Registrado /.phases/ em .git/info/exclude (nao mexe no .gitignore do projeto)"
+  if ! grep -qxF "$exclude_entry" "$exclude_file" 2>/dev/null; then
+    echo "$exclude_entry" >> "$exclude_file"
+    log "Registrado $exclude_entry em .git/info/exclude (nao mexe no .gitignore do projeto)"
   fi
+}
+
+system4u_path_is_never_allowed() {
+  local path="$1"
+
+  [[ "$path" == .env || "$path" == .env.* || "$path" == .env/* || "$path" == */.env || "$path" == */.env.* ]] && return 0
+  [[ "$path" == .git || "$path" == .git/* ]] && return 0
+  [[ "$path" == storage || "$path" == storage/* || "$path" == vendor || "$path" == vendor/* || "$path" == node_modules || "$path" == node_modules/* ]] && return 0
+  return 1
+}
+
+validate_system4u_allowed_paths_file() {
+  local root resolved raw entry entries=0
+
+  [ -n "$ALLOWED_PATHS_FILE" ] || { fail "system4u-autonomous exige --allowed-paths-file."; exit 1; }
+  [[ "$ALLOWED_PATHS_FILE" != /* ]] || { fail "--allowed-paths-file deve ser relativo ao repositorio."; exit 1; }
+  [[ ! "$ALLOWED_PATHS_FILE" =~ (^|/)\.\.(/|$) ]] || { fail "--allowed-paths-file nao pode conter traversal."; exit 1; }
+  [ -f "$ALLOWED_PATHS_FILE" ] || { fail "Allowlist nao encontrada: $ALLOWED_PATHS_FILE"; exit 1; }
+
+  root="$(git rev-parse --show-toplevel)"
+  resolved="$(realpath "$ALLOWED_PATHS_FILE")" || { fail "Nao foi possivel resolver a allowlist."; exit 1; }
+  case "$resolved" in "$root"/*) ;; *) fail "A allowlist deve permanecer dentro do repositorio."; exit 1 ;; esac
+
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    entry="$(printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    case "$entry" in ''|\#*) continue ;; esac
+    entry="${entry#./}"
+
+    case "$entry" in
+      *'*'*|*'?'*|*'['*)
+        fail "Entrada invalida na allowlist: $raw"
+        exit 1
+        ;;
+    esac
+    if [[ "$entry" == /* || "$entry" = "." || "$entry" =~ (^|/)\.\.(/|$) ]]; then
+      fail "Entrada invalida na allowlist: $raw"
+      exit 1
+    fi
+    if system4u_path_is_never_allowed "$entry"; then
+      fail "Entrada proibida na allowlist: $entry"
+      exit 1
+    fi
+    entries=$((entries + 1))
+  done < "$ALLOWED_PATHS_FILE"
+
+  [ "$entries" -gt 0 ] || { fail "A allowlist precisa declarar ao menos um path."; exit 1; }
+}
+
+system4u_path_allowed() {
+  local path="$1" raw entry
+  path="${path#./}"
+  system4u_path_is_never_allowed "$path" && return 1
+
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    entry="$(printf '%s' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    case "$entry" in ''|\#*) continue ;; esac
+    entry="${entry#./}"
+    if [[ "$entry" == */ ]]; then
+      [[ "$path" == "${entry%/}" || "$path" == "$entry"* ]] && return 0
+    elif [ "$path" = "$entry" ]; then
+      return 0
+    fi
+  done < "$ALLOWED_PATHS_FILE"
+
+  return 1
+}
+
+system4u_changed_paths() {
+  {
+    git diff --name-only
+    git diff --cached --name-only
+    git ls-files --others --exclude-standard
+  } | sort -u
+}
+
+SYSTEM4U_GUARD_CAUSE=""
+
+validate_system4u_changed_paths() {
+  local path blocked=0
+  SYSTEM4U_GUARD_CAUSE=""
+
+  if git diff --name-status --diff-filter=DR | grep -q . || git diff --cached --name-status --diff-filter=DR | grep -q .; then
+    SYSTEM4U_GUARD_CAUSE="o perfil bloqueia exclusoes e renomeacoes automaticas"
+    return 1
+  fi
+
+  while IFS= read -r path || [ -n "$path" ]; do
+    [ -n "$path" ] || continue
+    if ! system4u_path_allowed "$path"; then
+      printf 'Path fora da allowlist System4u: %s\n' "$path" >&2
+      blocked=1
+    fi
+  done < <(system4u_changed_paths)
+
+  if [ "$blocked" -ne 0 ]; then
+    SYSTEM4U_GUARD_CAUSE="houve alteracao fora da allowlist declarada"
+    return 1
+  fi
+
+  return 0
+}
+
+validate_system4u_profile() {
+  local root current_dir branch
+
+  [ "$ENGINE" = "codex" ] || { fail "system4u-autonomous aceita somente --engine codex."; exit 1; }
+  [ "$INPUT_FILE_EXPLICIT" = true ] || { fail "system4u-autonomous exige um arquivo de fases explicito."; exit 1; }
+  [ "$KEEP_GOING" = false ] || { fail "system4u-autonomous nao aceita --keep-going nem commits WIP."; exit 1; }
+  [ "$VERIFY_MODE" = "always" ] || { fail "system4u-autonomous exige RALPH_VERIFY=always e nao aceita --no-verify."; exit 1; }
+  [[ "$PHASES_DIR" != /* && ! "$PHASES_DIR" =~ (^|/)\.\.(/|$) && "$PHASES_DIR" != "." ]] || { fail "--run-dir deve ser relativo e sem traversal."; exit 1; }
+
+  root="$(git rev-parse --show-toplevel)"
+  current_dir="$(pwd -P)"
+  [ "$current_dir" = "$root" ] || { fail "system4u-autonomous deve ser iniciado na raiz do repositorio."; exit 1; }
+  branch="$(git branch --show-current)"
+  [ -n "$branch" ] && [ "$branch" != "main" ] || { fail "system4u-autonomous nao executa na branch main."; exit 1; }
+  [ ! -e "$PHASES_DIR" ] || { fail "Diretorio de artefatos ja existe: $PHASES_DIR. Use --run-dir com um nome novo; ele nunca e removido automaticamente."; exit 1; }
+
+  validate_system4u_allowed_paths_file
 }
 
 # Laravel Sail: a suite roda DENTRO do container. Rodar `composer test` /
@@ -349,6 +553,14 @@ preflight_checks() {
       ;;
   esac
 
+  case "$QUIET" in
+    true|false) ;;
+    *)
+      fail "Valor invalido para RALPH_QUIET: '$QUIET'. Use true ou false."
+      exit 1
+      ;;
+  esac
+
   # Verificacao e leitura + checklist: nao precisa do modelo de implementacao.
   # No codex nao ha default seguro de modelo barato — so aplica se pedido.
   if [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
@@ -357,12 +569,18 @@ preflight_checks() {
     VERIFY_MODEL="haiku"
   fi
 
-  if ! command -v "$ENGINE" &> /dev/null; then
-    if [[ "$ENGINE" == "codex" ]]; then
-      fail "codex CLI nao encontrado. Instale com: npm install -g @openai/codex"
-    else
-      fail "Claude Code CLI nao encontrado. Instale com: npm install -g @anthropic-ai/claude-code"
+  if [[ "$ENGINE" == "codex" ]]; then
+    if ! command -v rtk &> /dev/null; then
+      fail "rtk nao encontrado. Instale ou adicione o RTK ao PATH antes de rodar com Codex."
+      exit 1
     fi
+
+    if ! command -v codex &> /dev/null; then
+      fail "codex CLI nao encontrado. Instale com: npm install -g @openai/codex"
+      exit 1
+    fi
+  elif ! command -v claude &> /dev/null; then
+    fail "Claude Code CLI nao encontrado. Instale com: npm install -g @anthropic-ai/claude-code"
     exit 1
   fi
 
@@ -370,6 +588,14 @@ preflight_checks() {
     fail "Requer um repositorio git."
     exit 1
   fi
+
+  case "$PROFILE" in
+    default|system4u-autonomous) ;;
+    *)
+      fail "Perfil invalido: $PROFILE. Use default ou system4u-autonomous."
+      exit 1
+      ;;
+  esac
 
   resolve_input_file
 
@@ -379,6 +605,9 @@ preflight_checks() {
   fi
 
   validate_input_format
+  if is_system4u_profile; then
+    validate_system4u_profile
+  fi
   exclude_phases_dir
 
   # Arvore limpa: 'git add -A' da primeira fase engoliria trabalho nao commitado.
@@ -391,7 +620,7 @@ preflight_checks() {
 
   resolve_test_cmd
 
-  success "Pre-checks OK (engine: $ENGINE, input: $INPUT_FILE)"
+  success "Pre-checks OK (engine: $ENGINE, profile: $PROFILE, input: $INPUT_FILE)"
 }
 
 # ---------------------------------------------------------------------------
@@ -413,8 +642,13 @@ split_phases() {
     progress_backup=$(cat "$PROGRESS_FILE")
   fi
 
-  rm -rf "$PHASES_DIR"
-  mkdir -p "$PHASES_DIR" "$LOG_DIR" "$PROMPT_DIR"
+  if is_system4u_profile; then
+    mkdir -p "$PHASES_DIR"
+  else
+    rm -rf "$PHASES_DIR"
+    mkdir -p "$PHASES_DIR"
+  fi
+  mkdir -p "$LOG_DIR" "$PROMPT_DIR"
 
   # Progresso sobrevive entre execucoes, mas so vale para o MESMO input.
   if [ -n "$progress_backup" ]; then
@@ -508,6 +742,23 @@ tooling ja presente no repositorio. Se o projeto tiver uma ferramenta de memoria
 ou contexto configurada, use-a para entender o historico.
 PREAMBLE
 
+  if is_system4u_profile; then
+    cat <<'SYSTEM4U'
+
+## Limites do perfil system4u-autonomous
+Esta sessao e autonoma somente dentro do sandbox workspace-write. Nao use
+danger-full-access, nem ignore regras, hooks ou sandbox. Nao leia arquivos de
+ambiente, nao instale dependencias, nao execute migrations, nao acione provedores,
+pagamentos, deploy, push, merge, tag ou release. Nao faca commits: o Ralph faz o
+commit apenas depois dos gates verdes.
+
+Altere exclusivamente os paths da allowlist abaixo. Nao delete nem renomeie
+arquivos. Qualquer alteracao fora da allowlist reprova a fase.
+
+SYSTEM4U
+    sed 's/^/    - /' "$ALLOWED_PATHS_FILE"
+  fi
+
   # O gate 2 roda ESTE comando. Se o agente rodar outro (ex: `php artisan test`
   # no host de um projeto Sail), ele ve verde e o gate ve vermelho.
   if [ -n "$TEST_CMD" ]; then
@@ -519,7 +770,11 @@ PREAMBLE
     echo
     echo "Este e o comando exato usado para validar a fase. Nao use outro runner"
     echo "nem rode os testes por fora dele."
-    if [ -n "$SAIL_BIN" ]; then
+    if [[ "$TEST_CMD" == docker\ compose\ exec* ]]; then
+      echo "O projeto usa Docker Compose: artisan, composer, php e testes rodam DENTRO"
+      echo "do servico da aplicacao, via 'docker compose exec -T app <cmd>'. Nunca use Sail"
+      echo "nem rode essas ferramentas no host."
+    elif [ -n "$SAIL_BIN" ]; then
       echo "O projeto usa Laravel Sail: artisan, composer, php e testes rodam DENTRO"
       echo "do container, via '$SAIL_BIN <cmd>'. Nunca rode essas ferramentas no host."
     fi
@@ -710,6 +965,16 @@ wait_for_reset() {
 
 # run_engine <prompt_file> <log_file> <mode: impl|verify>
 # Loop de resiliencia a limite de uso: nao consome ciclo de correcao.
+capture_engine_output() {
+  local log_file="$1"
+
+  if [ "$QUIET" = true ]; then
+    cat > "$log_file"
+  else
+    tee "$log_file"
+  fi
+}
+
 run_engine() {
   local prompt_file="$1" log_file="$2" mode="$3"
 
@@ -726,9 +991,17 @@ run_engine() {
 
     if [[ "$ENGINE" == "codex" ]]; then
       if [[ "$mode" == "verify" ]]; then
-        codex exec --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+        if is_system4u_profile; then
+          rtk codex exec -c 'approval_policy="never"' --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" || rc=$?
+        else
+          rtk codex exec --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" || rc=$?
+        fi
       else
-        codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+        if is_system4u_profile; then
+          rtk codex exec -c 'approval_policy="never"' --sandbox workspace-write - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" || rc=$?
+        else
+          rtk codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" || rc=$?
+        fi
       fi
     else
       # < /dev/null: claude -p le stdin quando nao e TTY. Sem o redirect ele
@@ -738,12 +1011,12 @@ run_engine() {
           "${model_args[@]}" \
           -p "$(cat "$prompt_file")" \
           --allowedTools "Read,Glob,Grep" \
-          --output-format text < /dev/null 2>&1 | tee "$log_file" || rc=$?
+          --output-format text < /dev/null 2>&1 | capture_engine_output "$log_file" || rc=$?
       else
         # JSON: o exit code do CLI e sinal fraco; o gate 0 le is_error.
         env -u CLAUDECODE claude --dangerously-skip-permissions \
           -p "$(cat "$prompt_file")" \
-          --output-format json < /dev/null 2>&1 | tee "$log_file" || rc=$?
+          --output-format json < /dev/null 2>&1 | capture_engine_output "$log_file" || rc=$?
       fi
     fi
 
@@ -816,6 +1089,7 @@ gate2_tests_pass() {
   local test_log="$1"
 
   if [ -z "$TEST_CMD" ]; then
+    LAST_TEST_RESULT="Gate 2 nao configurado"
     return 0
   fi
 
@@ -831,6 +1105,7 @@ gate2_tests_pass() {
   fi
 
   success "Gate 2 — suite verde"
+  LAST_TEST_RESULT="Gate 2 verde"
   return 0
 }
 
@@ -853,11 +1128,13 @@ gate3_independent_verify() {
   case "$VERIFY_MODE" in
     off)
       log "Gate 3 pulado (--no-verify)"
+      LAST_VERIFY_RESULT="Gate 3 pulado (--no-verify)"
       return 0
       ;;
     auto)
       if [ "$cycle" -eq 1 ] && [ "$session_wrote" -eq 1 ] && [ -n "$TEST_CMD" ]; then
         log "Gate 3 pulado: a sessao escreveu codigo e a suite passou (RALPH_VERIFY=always para rodar sempre)"
+        LAST_VERIFY_RESULT="Gate 3 pulado (modo auto)"
         return 0
       fi
       ;;
@@ -868,6 +1145,7 @@ gate3_independent_verify() {
 
   if [ "$expected" -eq 0 ]; then
     warn "Gate 3 pulado: a fase nao declara nenhuma task '- [ ]'"
+    LAST_VERIFY_RESULT="Gate 3 pulado (sem tasks declaradas)"
     return 0
   fi
 
@@ -879,7 +1157,33 @@ gate3_independent_verify() {
   run_engine "$prompt_file" "$verify_log" verify || true
 
   local task_lines
-  task_lines=$(sed 's/^[[:space:]]*//' "$verify_log" | grep -E '^TASK [0-9]+: (DONE|INCOMPLETE)' || true)
+  task_lines=$(
+    sed 's/^[[:space:]]*//' "$verify_log" |
+      grep -E '^TASK [0-9]+: (DONE|INCOMPLETE)' |
+      awk -v expected="$expected" '
+        BEGIN {
+          expected += 0
+        }
+
+        {
+          task_number = $2
+          sub(/:$/, "", task_number)
+          task_number += 0
+
+          if (task_number >= 1 && task_number <= expected) {
+            task_lines[task_number] = $0
+          }
+        }
+
+        END {
+          for (task_number = 1; task_number <= expected; task_number++) {
+            if (task_number in task_lines) {
+              print task_lines[task_number]
+            }
+          }
+        }
+      ' || true
+  )
 
   local parsed
   parsed=$(printf '%s' "$task_lines" | grep -c . || true)
@@ -903,6 +1207,7 @@ gate3_independent_verify() {
   fi
 
   success "Gate 3 — $parsed/$expected tasks confirmadas no codigo"
+  LAST_VERIFY_RESULT="Gate 3 verde ($parsed/$expected tasks)"
   return 0
 }
 
@@ -912,17 +1217,38 @@ gate3_independent_verify() {
 
 commit_phase() {
   local phase_num="$1" phase_title="$2"
-  git add -A
+  local changed_paths=()
+
+  if is_system4u_profile; then
+    validate_system4u_changed_paths || {
+      fail "Commit bloqueado pelo perfil System4u: $SYSTEM4U_GUARD_CAUSE"
+      return 1
+    }
+    mapfile -t changed_paths < <(system4u_changed_paths)
+    [ "${#changed_paths[@]}" -gt 0 ] || {
+      fail "Nada para commitar apos os gates — estado inesperado."
+      return 1
+    }
+    git add -- "${changed_paths[@]}"
+  else
+    git add -A
+  fi
   if git diff --cached --quiet; then
     fail "Nada para commitar apos os gates — estado inesperado."
     return 1
   fi
   git commit -q -m "feat(phase-${phase_num}): ${phase_title}"
+  LAST_PHASE_COMMIT=$(git rev-parse --short HEAD)
+  LAST_PHASE_FILES=$(git show --format= --name-only HEAD | sed '/^$/d' | paste -sd ', ' -)
   log "Commit criado: feat(phase-${phase_num}): ${phase_title}"
 }
 
 commit_wip() {
   local phase_num="$1"
+  if is_system4u_profile; then
+    fail "Commit WIP bloqueado pelo perfil system4u-autonomous."
+    return 1
+  fi
   [ -n "$(git status --porcelain)" ] || return 0
   git add -A
   git commit -q -m "wip(phase-${phase_num}): incomplete — see .phases/logs/"
@@ -941,6 +1267,10 @@ run_phase() {
 
   LIMIT_WAITS=0
   GATE_CAUSE=""
+  LAST_TEST_RESULT="Gate 2 nao executado"
+  LAST_VERIFY_RESULT="Gate 3 nao executado"
+  LAST_PHASE_COMMIT="nenhum"
+  LAST_PHASE_FILES="nenhum"
 
   echo ""
   log "[$seq/$total] Phase $phase_num: $phase_title"
@@ -978,6 +1308,10 @@ run_phase() {
     if ! gate0_engine_finished "$log_file" "$rc"; then
       LAST_GATE="gate 0 — engine nao concluiu"
       fail "Gate 0 vermelho"
+    elif is_system4u_profile && ! validate_system4u_changed_paths; then
+      LAST_GATE="guardrail System4u"
+      GATE_CAUSE="$SYSTEM4U_GUARD_CAUSE"
+      fail "Guardrail System4u vermelho — alteracao fora da allowlist ou exclusao automatica"
     elif ! gate2_tests_pass "$LOG_DIR/${phase_file%.md}.test-${cycle}.log"; then
       LAST_GATE="gate 2 — suite de testes do projeto"
       GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
@@ -999,15 +1333,21 @@ run_phase() {
           log "Gate 2 verde contra o codigo em HEAD; nenhum commit criado."
         fi
         mark_phase_done "$phase_file"
+        record_phase_report "$phase_num" "$phase_title" "ja implementada" "$cycle" "$(format_duration "$phase_duration")" "$LAST_TEST_RESULT" "$LAST_VERIFY_RESULT" "$LAST_PHASE_COMMIT" "$LAST_PHASE_FILES" "nenhuma"
+        phase_summary "$phase_num" "$phase_title" "$seq" "$total" "ja implementada" "$(format_duration "$phase_duration")" "$cycle" "nenhum commit criado" "$LOG_DIR/${phase_file%.md}.*"
         return 0
       fi
 
       success "Phase $phase_num: $phase_title — COMPLETA ($(format_duration "$phase_duration"))"
       if ! commit_phase "$phase_num" "$phase_title"; then
         LAST_GATE="commit"
+        record_phase_report "$phase_num" "$phase_title" "falhou" "$cycle" "$(format_duration "$phase_duration")" "$LAST_TEST_RESULT" "$LAST_VERIFY_RESULT" "$LAST_PHASE_COMMIT" "$LAST_PHASE_FILES" "$LAST_GATE"
+        phase_summary "$phase_num" "$phase_title" "$seq" "$total" "falhou" "$(format_duration "$phase_duration")" "$cycle" "falha ao criar o commit" "$LOG_DIR/${phase_file%.md}.*"
         return 1
       fi
       mark_phase_done "$phase_file"
+      record_phase_report "$phase_num" "$phase_title" "completa" "$cycle" "$(format_duration "$phase_duration")" "$LAST_TEST_RESULT" "$LAST_VERIFY_RESULT" "$LAST_PHASE_COMMIT" "$LAST_PHASE_FILES" "nenhuma"
+      phase_summary "$phase_num" "$phase_title" "$seq" "$total" "completa" "$(format_duration "$phase_duration")" "$cycle" "commit feat(phase-${phase_num}) criado" "$LOG_DIR/${phase_file%.md}.*"
       return 0
     fi
 
@@ -1015,6 +1355,8 @@ run_phase() {
   done
 
   local phase_duration=$(($(date +%s) - phase_start))
+  record_phase_report "$phase_num" "$phase_title" "falhou" "$MAX_CYCLES" "$(format_duration "$phase_duration")" "$LAST_TEST_RESULT" "$LAST_VERIFY_RESULT" "$LAST_PHASE_COMMIT" "$LAST_PHASE_FILES" "$LAST_GATE"
+  phase_summary "$phase_num" "$phase_title" "$seq" "$total" "falhou" "$(format_duration "$phase_duration")" "$MAX_CYCLES" "$LAST_GATE" "$LOG_DIR/${phase_file%.md}.*"
   fail "Phase $phase_num: $phase_title — FALHOU apos $MAX_CYCLES ciclos ($(format_duration "$phase_duration"))"
   fail "Ultima causa ($LAST_GATE):"
   printf '%s\n' "$GATE_CAUSE" | head -n 20 | sed 's/^/    /'
@@ -1086,12 +1428,14 @@ main() {
     if [ "$num" -lt "$FROM_PHASE" ]; then
       log "Pulando Phase $num: $title (antes de --from $FROM_PHASE)"
       skipped_phases+=("$title")
+      record_phase_report "$num" "$title" "pulada" "0" "0s" "nao executado" "nao executada" "nenhum" "nenhum" "antes de --from $FROM_PHASE"
       continue
     fi
 
     if is_phase_done "$file"; then
       log "Pulando Phase $num: $title (ja completada)"
       skipped_phases+=("$title")
+      record_phase_report "$num" "$title" "pulada" "0" "0s" "nao executado" "nao executada" "nenhum" "nenhum" "ja completada em run anterior"
       continue
     fi
 
@@ -1137,6 +1481,14 @@ main() {
     for phase in "${failed_phases[@]}"; do printf '    %b%s%b\n' "$RED" "$phase" "$NC"; done
     echo ""
     fail "Verifique os logs em $LOG_DIR/"
+  fi
+
+  print_delivery_summary
+
+  if [ ${#failed_phases[@]} -eq 0 ]; then
+    success "Pendencias do run: nenhuma."
+  else
+    fail "Pendencias do run: ${#failed_phases[@]} fase(s) requer(em) correcao."
   fi
 
   echo ""

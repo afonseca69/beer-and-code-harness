@@ -50,7 +50,7 @@ Commands are namespaced: `/bc-harness:init`, `/bc-harness:plan`, etc. (abbreviat
 
 **ralph.sh prerequisites:**
 
-- Codex engine: `npm install -g @openai/codex` + `OPENAI_API_KEY`
+- Codex engine: `rtk` + `npm install -g @openai/codex` + `OPENAI_API_KEY` (ralph runs `rtk codex exec`)
 - Claude engine: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
 - Root of a git repository with a **clean** working tree
 
@@ -146,6 +146,21 @@ With no argument, the input resolves in this order: `.spec/init/project-phases.m
 
 > **Autonomy and permissions note**: ralph is an unattended orchestrator by design. With the Claude engine, implementation sessions run with `--dangerously-skip-permissions` — the agent can edit files and run commands in the repository without prompting. Run it only in repositories you trust, ideally in a disposable branch or isolated environment (container/VM). Every phase lands as a separate commit, so `git revert`/`git reset` always gets you back. The verification session (gate 3) is restricted to read-only tools (`Read,Glob,Grep`).
 
+### `system4u-autonomous` profile
+
+This opt-in Codex profile is for System4u Portal's guarded autonomous runs. It is non-interactive, but it is **not** unrestricted YOLO: implementation uses `rtk codex exec -c 'approval_policy="never"' --sandbox workspace-write`, while verification stays read-only.
+
+It requires a clean non-`main` branch, an explicit phase document, `RALPH_VERIFY=always`, a new local artifact directory, and a repository-relative allowlist. It rejects deletions, renames, `.env`, `.git`, `storage/`, `vendor/`, and `node_modules/`; it never pushes, merges, deploys, installs dependencies, or runs migrations. Completed phases are committed only after the changed paths pass the allowlist.
+
+```bash
+scripts/ralph.sh --engine codex --profile system4u-autonomous --quiet \
+  --allowed-paths-file controls/approved-paths.txt \
+  --run-dir .ralph-system4u-20260728 \
+  docs/approved-phases.md
+```
+
+The allowlist is line-based: exact files or directory prefixes ending in `/`; blank lines and `#` comments are ignored. It must be committed before the run and may not include globs, traversal, secrets, Git metadata, or generated/runtime directories.
+
 ### Invariants
 
 1. Every phase **and** every fix cycle runs in a fresh session with a self-contained prompt. Sessions are never reused.
@@ -183,6 +198,10 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 | `--max-cycles N` | Fix cycles per phase (default: 3) |
 | `--test-cmd "<cmd>"` | Project test command (gate 2) |
 | `--no-verify` | Disables gate 3 |
+| `-q`, `--quiet` | Hides raw Codex/Claude output from the terminal and prints a summary when each phase ends; full logs remain in `.phases/logs/` |
+| `--profile system4u-autonomous` | Guarded non-interactive Codex profile: workspace-write, explicit allowlist, no WIP commits or destructive cleanup |
+| `--allowed-paths-file <path>` | Required repository-relative allowlist for `system4u-autonomous` |
+| `--run-dir <path>` | Fresh local artifact directory for `system4u-autonomous` (default: `.ralph-system4u`) |
 
 | Variable | Effect |
 |---|---|
