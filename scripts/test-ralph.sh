@@ -633,6 +633,7 @@ if case_enabled limit-generic; then
   assert_contains "$d/out.log" "Sem horario de reset no output" "usou o fallback de espera"
   assert_eq 3 "$(commits "$d")" "fases commitadas apos a espera"
   assert_eq $'retry-model|low\nretry-model|low\nretry-model|low' "$(cat "$d/state/impl_configs")" "retry de limite preserva modelo e reasoning nas sessoes mutaveis"
+  assert_eq 3 "$(grep -cF -- "Implementacao/correcao — gravando" "$d/out.log")" "cada sessao mutavel, inclusive retry por limite, anuncia gravacao"
 fi
 
 # ---------------------------------------------------------------------------
@@ -973,9 +974,11 @@ fi
 if case_enabled verify-runtime-quiet; then
   header "27. runtime efetivo do Codex aparece em quiet"
   d=$(new_case verify-runtime-quiet)
+  use_single_phase_fixture "$d"
   rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh" --max-cycles 1 --quiet)
   assert_eq 0 "$rc" "exit 0"
   assert_contains "$d/out.log" "Gate 3 — gravando | engine: codex | modelo: herdado | reasoning: herdado | sandbox: read-only | log: .phases/logs/phase-01.verify-1.log" "inicio informa config, sandbox, log e gravacao"
+  assert_eq 1 "$(grep -cF -- "Gate 3 — gravando" "$d/out.log")" "Gate 3 e anunciado exatamente uma vez antes da verificacao"
   assert_contains "$d/out.log" "model: gpt-mock-inherited" "terminal mostra modelo efetivo"
   assert_contains "$d/out.log" "reasoning effort: medium" "terminal mostra reasoning efetivo"
   assert_not_contains "$d/out.log" "provider: mock" "quiet nao espelha o cabecalho inteiro"
@@ -1261,11 +1264,11 @@ if case_enabled impl-config; then
   rc=$(CASE_MODEL=env-model CASE_REASONING=low \
     CASE_VERIFY_MODEL=verify-env CASE_VERIFY_REASONING=low \
     run_ralph "$d" test-red-once --engine codex --test-cmd "$d/test.sh" --max-cycles 2 \
-      --model flag-model --reasoning high --verify-model verify-flag --verify-reasoning xhigh)
+      --model flag-model --reasoning minimal --verify-model verify-flag --verify-reasoning xhigh)
   assert_eq 0 "$rc" "exit 0 com ciclo corretivo"
-  assert_eq $'flag-model|high\nflag-model|high' "$(cat "$d/state/impl_configs")" "flags de implementacao prevalecem no inicio e na correcao"
+  assert_eq $'flag-model|minimal\nflag-model|minimal' "$(cat "$d/state/impl_configs")" "reasoning minimal chega a implementacao inicial e correcao"
   assert_eq "verify-flag|xhigh" "$(cat "$d/state/verify_configs")" "Gate 3 permanece separado e usa seus proprios controles"
-  assert_contains "$d/state/codex_args" 'model_reasoning_effort="high"' "reasoning de implementacao chega ao Codex"
+  assert_contains "$d/state/codex_args" 'model_reasoning_effort="minimal"' "reasoning minimal de implementacao/correcao chega ao Codex"
   assert_contains "$d/state/codex_args" 'model_reasoning_effort="xhigh"' "reasoning do Gate 3 continua independente"
 
   d2=$(new_case impl-config-env)

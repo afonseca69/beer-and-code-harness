@@ -1429,15 +1429,6 @@ gate3_independent_verify() {
   fi
 
   GATE3_RAN=1
-  local requested_model requested_reasoning
-  requested_model="${VERIFY_MODEL:-herdado}"
-  if [ "$ENGINE" = "claude" ]; then
-    requested_reasoning="nao aplicavel"
-  else
-    requested_reasoning="${VERIFY_REASONING:-herdado}"
-  fi
-  log "Gate 3 — gravando | engine: $ENGINE | modelo: $requested_model | reasoning: $requested_reasoning | sandbox: read-only | log: $verify_log"
-
   local prompt_file
   prompt_file=$(build_verify_prompt "$phase_file" "$cycle")
   run_engine "$prompt_file" "$verify_log" verify || true
