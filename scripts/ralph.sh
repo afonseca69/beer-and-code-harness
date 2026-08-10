@@ -27,6 +27,8 @@
 #   --keep-going             continua apos uma fase falhar (default: para)
 #   --max-cycles N           hard cap total de ciclos por fase (default: 12)
 #   --max-stalled-cycles N   ciclos corretivos sem progresso (default: 2)
+#   --model MODEL            modelo das sessoes de implementacao/correcao
+#   --reasoning EFFORT       reasoning Codex das sessoes de implementacao/correcao
 #   --verify-model MODEL     modelo do verificador (flag > RALPH_VERIFY_MODEL)
 #   --verify-reasoning E     reasoning Codex: minimal|low|medium|high|xhigh
 #   --no-verify              desliga o gate 3 (equivale a RALPH_VERIFY=off)
@@ -74,6 +76,12 @@
 #   - Cada tentativa exige phase-NN.verify-C.log nao vazio; ausencia ou log
 #     vazio deixa o Gate 3 vermelho por falha operacional.
 #
+# Configuracao das sessoes mutaveis:
+#   - --model/--reasoning prevalecem sobre RALPH_MODEL/RALPH_REASONING;
+#     sem override, o engine herda a configuracao dele.
+#   - Codex aceita reasoning minimal|low|medium|high|xhigh.
+#   - Claude aceita modelo explicito, mas reasoning nao e aplicavel.
+#
 # Remediacao e causas de parada:
 #   - MAX_CYCLES e o hard cap total, incluindo a implementacao inicial
 #     (default: 12). Gate vermelho abre uma nova sessao corretiva.
@@ -113,6 +121,8 @@
 #
 # Variaveis de ambiente:
 #   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
+#   RALPH_MODEL              modelo das sessoes de implementacao/correcao
+#   RALPH_REASONING          reasoning Codex das sessoes de implementacao/correcao
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
 #   RALPH_VERIFY_MODEL       modelo do verificador (default: haiku no claude)
 #   RALPH_VERIFY_REASONING   reasoning do verificador Codex
@@ -149,6 +159,12 @@ TEST_CMD_FLAG=""
 MAX_CYCLES="${RALPH_MAX_CYCLES:-12}"
 MAX_STALLED_CYCLES="${RALPH_MAX_STALLED_CYCLES:-2}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
+MODEL=""
+MODEL_FLAG=""
+MODEL_FLAG_SET=false
+REASONING=""
+REASONING_FLAG=""
+REASONING_FLAG_SET=false
 VERIFY_MODEL=""
 VERIFY_MODEL_FLAG=""
 VERIFY_MODEL_FLAG_SET=false
@@ -171,6 +187,28 @@ while [[ $# -gt 0 ]]; do
     --max-cycles=*) MAX_CYCLES="${1#*=}"; shift ;;
     --max-stalled-cycles) MAX_STALLED_CYCLES="$2"; shift 2 ;;
     --max-stalled-cycles=*) MAX_STALLED_CYCLES="${1#*=}"; shift ;;
+    --model)
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        MODEL_FLAG=""
+        shift
+      else
+        MODEL_FLAG="$2"
+        shift 2
+      fi
+      MODEL_FLAG_SET=true
+      ;;
+    --model=*)    MODEL_FLAG="${1#*=}"; MODEL_FLAG_SET=true; shift ;;
+    --reasoning)
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        REASONING_FLAG=""
+        shift
+      else
+        REASONING_FLAG="$2"
+        shift 2
+      fi
+      REASONING_FLAG_SET=true
+      ;;
+    --reasoning=*) REASONING_FLAG="${1#*=}"; REASONING_FLAG_SET=true; shift ;;
     --verify-model) VERIFY_MODEL_FLAG="$2"; VERIFY_MODEL_FLAG_SET=true; shift 2 ;;
     --verify-model=*) VERIFY_MODEL_FLAG="${1#*=}"; VERIFY_MODEL_FLAG_SET=true; shift ;;
     --verify-reasoning) VERIFY_REASONING_FLAG="$2"; VERIFY_REASONING_FLAG_SET=true; shift 2 ;;
@@ -612,6 +650,42 @@ preflight_checks() {
       exit 1
       ;;
   esac
+
+  # Implementacao/correcao: flag explicita > ambiente > heranca do engine.
+  # A flag vazia e um erro deliberado, enquanto ambiente vazio equivale a
+  # ausencia de override e preserva a configuracao herdada.
+  if [ "$MODEL_FLAG_SET" = true ]; then
+    if [ -z "$MODEL_FLAG" ]; then
+      fail "--model exige um valor nao vazio para as sessoes de implementacao/correcao."
+      exit 1
+    fi
+    MODEL="$MODEL_FLAG"
+  elif [ -n "${RALPH_MODEL:-}" ]; then
+    MODEL="$RALPH_MODEL"
+  fi
+
+  if [ "$REASONING_FLAG_SET" = true ]; then
+    if [ -z "$REASONING_FLAG" ]; then
+      fail "--reasoning exige um valor nao vazio para as sessoes de implementacao/correcao."
+      exit 1
+    fi
+    REASONING="$REASONING_FLAG"
+  elif [ -n "${RALPH_REASONING:-}" ]; then
+    REASONING="$RALPH_REASONING"
+  fi
+
+  if [[ "$ENGINE" == "codex" && -n "$REASONING" ]]; then
+    case "$REASONING" in
+      minimal|low|medium|high|xhigh) ;;
+      *)
+        fail "Reasoning invalido para sessoes de implementacao/correcao Codex: '$REASONING'. Use minimal, low, medium, high ou xhigh."
+        exit 1
+        ;;
+    esac
+  elif [[ "$ENGINE" == "claude" && -n "$REASONING" ]]; then
+    fail "Reasoning de implementacao/correcao nao e compativel com o engine Claude. Remova --reasoning/RALPH_REASONING."
+    exit 1
+  fi
 
   # Verificacao e leitura + checklist: nao precisa do modelo de implementacao.
   # Flags prevalecem sobre env; vazio significa herdar a configuracao do Codex.
@@ -1075,10 +1149,14 @@ run_engine() {
   export RALPH_PHASE_MAX_ATTEMPTS="$MAX_CYCLES"
 
   local model_args=() reasoning_args=()
-  if [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
+  if [[ "$mode" == "impl" ]] && [ -n "$MODEL" ]; then
+    model_args=(--model "$MODEL")
+  elif [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
     model_args=(--model "$VERIFY_MODEL")
   fi
-  if [[ "$mode" == "verify" && "$ENGINE" == "codex" ]] && [ -n "$VERIFY_REASONING" ]; then
+  if [[ "$mode" == "impl" && "$ENGINE" == "codex" ]] && [ -n "$REASONING" ]; then
+    reasoning_args=(-c "model_reasoning_effort=\"$REASONING\"")
+  elif [[ "$mode" == "verify" && "$ENGINE" == "codex" ]] && [ -n "$VERIFY_REASONING" ]; then
     reasoning_args=(-c "model_reasoning_effort=\"$VERIFY_REASONING\"")
   fi
 
@@ -1094,9 +1172,9 @@ run_engine() {
         fi
       else
         if is_system4u_profile; then
-          rtk codex exec -c 'approval_policy="never"' --sandbox workspace-write - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
+          rtk codex exec -c 'approval_policy="never"' --sandbox workspace-write "${model_args[@]}" "${reasoning_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
         else
-          rtk codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
+          rtk codex exec --sandbox danger-full-access "${model_args[@]}" "${reasoning_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
         fi
       fi
     else
@@ -1111,6 +1189,7 @@ run_engine() {
       else
         # JSON: o exit code do CLI e sinal fraco; o gate 0 le is_error.
         env -u CLAUDECODE claude --dangerously-skip-permissions \
+          "${model_args[@]}" \
           -p "$(cat "$prompt_file")" \
           --output-format json < /dev/null 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
       fi

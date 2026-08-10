@@ -112,6 +112,11 @@ fi
 if [ "$verify" -eq 1 ] && [ -n "$reasoning" ]; then
   echo "$reasoning" > "$state/verify_reasoning"
 fi
+if [ "$verify" -eq 1 ]; then
+  printf '%s|%s\n' "${model:-<inherited>}" "${reasoning:-<inherited>}" >> "$state/verify_configs"
+else
+  printf '%s|%s\n' "${model:-<inherited>}" "${reasoning:-<inherited>}" >> "$state/impl_configs"
+fi
 
 # --- verificador independente ------------------------------------------------
 # Verifica o CODIGO REAL, como o verificador de verdade: sem arquivo de
@@ -454,6 +459,8 @@ run_ralph() {
     MOCK_TEST_CMD="$dir/test.sh" \
     RALPH_LIMIT_WAIT_DEFAULT=1 \
     RALPH_LIMIT_BUFFER=1 \
+    RALPH_MODEL="${CASE_MODEL:-}" \
+    RALPH_REASONING="${CASE_REASONING:-}" \
     RALPH_VERIFY="${CASE_VERIFY:-}" \
     RALPH_VERIFY_MODEL="${CASE_VERIFY_MODEL:-}" \
     RALPH_VERIFY_REASONING="${CASE_VERIFY_REASONING:-}" \
@@ -604,10 +611,11 @@ fi
 if case_enabled limit-generic; then
   header "6. limite generico sem epoch -> fallback"
   d=$(new_case limit-generic)
-  rc=$(run_ralph "$d" limit-generic --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  rc=$(CASE_MODEL=retry-model CASE_REASONING=low run_ralph "$d" limit-generic --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
   assert_eq 0 "$rc" "exit 0"
   assert_contains "$d/out.log" "Sem horario de reset no output" "usou o fallback de espera"
   assert_eq 3 "$(commits "$d")" "fases commitadas apos a espera"
+  assert_eq $'retry-model|low\nretry-model|low\nretry-model|low' "$(cat "$d/state/impl_configs")" "retry de limite preserva modelo e reasoning nas sessoes mutaveis"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1194,9 +1202,94 @@ if case_enabled help-contract; then
   assert_contains "$help_log" "phase-NN.verify-C.log nao vazio" "help documenta log obrigatorio do Gate 3"
   assert_contains "$help_log" "Limite de uso nao consome ciclo" "help preserva semantica de usage limit"
   assert_contains "$help_log" "RALPH_VERIFY_REASONING" "help lista env de reasoning"
+  assert_contains "$help_log" "--model MODEL            modelo das sessoes de implementacao/correcao" "help lista modelo de implementacao"
+  assert_contains "$help_log" "--reasoning EFFORT       reasoning Codex das sessoes de implementacao/correcao" "help lista reasoning de implementacao"
+  assert_contains "$help_log" "RALPH_MODEL              modelo das sessoes de implementacao/correcao" "help lista RALPH_MODEL"
+  assert_contains "$help_log" "RALPH_REASONING          reasoning Codex das sessoes de implementacao/correcao" "help lista RALPH_REASONING"
+  assert_contains "$help_log" "--model/--reasoning prevalecem sobre RALPH_MODEL/RALPH_REASONING" "help documenta precedencia das sessoes mutaveis"
+  assert_contains "$help_log" "Claude aceita modelo explicito, mas reasoning nao e aplicavel" "help separa compatibilidade Claude"
   assert_contains "$help_log" "RALPH_MAX_STALLED_CYCLES" "help lista env de estagnacao"
   assert_contains "$help_log" "RALPH_PHASE_MAX_ATTEMPTS igual a RALPH_MAX_CYCLES" "help lista export do hard cap efetivo"
   assert_contains "$help_log" "Isso nao amplia permissoes operacionais" "help separa autorizacao funcional e operacional"
+fi
+
+# ---------------------------------------------------------------------------
+# 35. Modelo/reasoning das sessoes mutaveis usam flag > ambiente > heranca,
+#     sem misturar os controles independentes do Gate 3.
+# ---------------------------------------------------------------------------
+if case_enabled impl-config; then
+  header "35. configuracao deterministica das sessoes mutaveis"
+  d=$(new_case impl-config)
+  use_single_phase_fixture "$d"
+  rc=$(CASE_MODEL=env-model CASE_REASONING=low \
+    CASE_VERIFY_MODEL=verify-env CASE_VERIFY_REASONING=low \
+    run_ralph "$d" test-red-once --engine codex --test-cmd "$d/test.sh" --max-cycles 2 \
+      --model flag-model --reasoning high --verify-model verify-flag --verify-reasoning xhigh)
+  assert_eq 0 "$rc" "exit 0 com ciclo corretivo"
+  assert_eq $'flag-model|high\nflag-model|high' "$(cat "$d/state/impl_configs")" "flags de implementacao prevalecem no inicio e na correcao"
+  assert_eq "verify-flag|xhigh" "$(cat "$d/state/verify_configs")" "Gate 3 permanece separado e usa seus proprios controles"
+  assert_contains "$d/state/codex_args" 'model_reasoning_effort="high"' "reasoning de implementacao chega ao Codex"
+  assert_contains "$d/state/codex_args" 'model_reasoning_effort="xhigh"' "reasoning do Gate 3 continua independente"
+
+  d2=$(new_case impl-config-env)
+  use_single_phase_fixture "$d2"
+  rc=$(CASE_MODEL=env-model CASE_REASONING=medium \
+    run_ralph "$d2" ok --engine codex --test-cmd "$d2/test.sh" --max-cycles 1 \
+      --verify-model verifier --verify-reasoning low)
+  assert_eq 0 "$rc" "exit 0 com fallback por ambiente"
+  assert_eq "env-model|medium" "$(cat "$d2/state/impl_configs")" "ambiente configura as sessoes mutaveis sem flags"
+  assert_eq "verifier|low" "$(cat "$d2/state/verify_configs")" "ambiente/flags do Gate 3 nao sao substituidos pela implementacao"
+
+  d3=$(new_case impl-config-inherited)
+  rc=$(run_ralph "$d3" ok --engine codex --test-cmd "$d3/test.sh" --max-cycles 1 --no-verify)
+  assert_eq 0 "$rc" "exit 0 sem override"
+  assert_eq $'<inherited>|<inherited>\n<inherited>|<inherited>' "$(cat "$d3/state/impl_configs")" "sem override o Codex herda modelo e reasoning"
+  assert_not_contains "$d3/state/codex_args" "--model" "sem override nao passa modelo ao Codex"
+  assert_not_contains "$d3/state/codex_args" "model_reasoning_effort" "sem override nao passa reasoning ao Codex"
+
+  d4=$(new_case impl-config-claude)
+  rc=$(run_ralph "$d4" ok --engine claude --test-cmd "$d4/test.sh" --max-cycles 1 --model claude-model)
+  assert_eq 0 "$rc" "exit 0 com modelo explicito no Claude"
+  assert_eq $'claude-model|<inherited>\nclaude-model|<inherited>' "$(cat "$d4/state/impl_configs")" "modelo chega as sessoes Claude de implementacao"
+  assert_eq $'haiku|<inherited>\nhaiku|<inherited>' "$(cat "$d4/state/verify_configs")" "modelo default haiku do verificador permanece independente"
+fi
+
+# ---------------------------------------------------------------------------
+# 36. Flags vazias e reasoning invalido/incompativel falham no preflight,
+#     antes de implementar ou verificar.
+# ---------------------------------------------------------------------------
+if case_enabled impl-preflight; then
+  header "36. preflight valida configuracao das sessoes mutaveis"
+  d=$(new_case impl-model-empty)
+  rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh" --model=)
+  assert_eq 1 "$rc" "modelo vazio falha no preflight"
+  assert_contains "$d/out.log" "--model exige um valor nao vazio" "erro de modelo vazio e claro"
+  test -f "$d/state/impl_calls" && bad "modelo vazio nao inicia implementacao" || ok "modelo vazio nao inicia implementacao"
+  test -f "$d/state/verify_calls" && bad "modelo vazio nao inicia verificacao" || ok "modelo vazio nao inicia verificacao"
+
+  d2=$(new_case impl-reasoning-empty)
+  rc=$(run_ralph "$d2" ok --engine codex --test-cmd "$d2/test.sh" --reasoning=)
+  assert_eq 1 "$rc" "reasoning vazio falha no preflight"
+  assert_contains "$d2/out.log" "--reasoning exige um valor nao vazio" "erro de reasoning vazio e claro"
+  test -f "$d2/state/impl_calls" && bad "reasoning vazio nao inicia implementacao" || ok "reasoning vazio nao inicia implementacao"
+
+  d3=$(new_case impl-reasoning-invalid)
+  rc=$(run_ralph "$d3" ok --engine codex --test-cmd "$d3/test.sh" --reasoning=turbo)
+  assert_eq 1 "$rc" "reasoning Codex invalido falha"
+  assert_contains "$d3/out.log" "Reasoning invalido para sessoes de implementacao/correcao Codex" "erro lista os esforcos aceitos"
+  test -f "$d3/state/impl_calls" && bad "reasoning Codex invalido nao inicia implementacao" || ok "reasoning Codex invalido nao inicia implementacao"
+
+  d4=$(new_case impl-reasoning-claude)
+  rc=$(run_ralph "$d4" ok --engine claude --test-cmd "$d4/test.sh" --reasoning=low)
+  assert_eq 1 "$rc" "reasoning Claude explicito falha"
+  assert_contains "$d4/out.log" "Reasoning de implementacao/correcao nao e compativel com o engine Claude" "incompatibilidade Claude e clara"
+  test -f "$d4/state/impl_calls" && bad "reasoning Claude nao inicia implementacao" || ok "reasoning Claude nao inicia implementacao"
+
+  d5=$(new_case impl-reasoning-claude-env)
+  rc=$(CASE_REASONING=medium run_ralph "$d5" ok --engine claude --test-cmd "$d5/test.sh")
+  assert_eq 1 "$rc" "reasoning Claude por ambiente falha"
+  assert_contains "$d5/out.log" "Remova --reasoning/RALPH_REASONING" "erro de ambiente Claude orienta a remocao"
+  test -f "$d5/state/impl_calls" && bad "reasoning Claude por ambiente nao inicia implementacao" || ok "reasoning Claude por ambiente nao inicia implementacao"
 fi
 
 # ---------------------------------------------------------------------------
