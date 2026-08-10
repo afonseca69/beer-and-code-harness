@@ -70,9 +70,10 @@
 #   - --verify-model/--verify-reasoning prevalecem sobre as variaveis de
 #     ambiente; sem valor configurado, o Codex herda modelo/reasoning.
 #   - Claude usa haiku por default e nao aceita override de reasoning.
-#   - Antes da verificacao, o terminal informa a configuracao solicitada,
-#     sandbox read-only e log. No Codex, o cabecalho emitido pelo CLI e o
-#     runtime efetivo: modelo/reasoning ficam no log e aparecem ate em --quiet.
+#   - Antes de cada implementacao/correcao e da verificacao, o terminal
+#     informa a configuracao solicitada, o sandbox e o log.
+#   - No Codex, runtime efetivo: modelo/reasoning ficam no log; em quiet
+#     eles tambem aparecem no modo impl.
 #   - Cada tentativa exige phase-NN.verify-C.log nao vazio; ausencia ou log
 #     vazio deixa o Gate 3 vermelho por falha operacional.
 #
@@ -1127,19 +1128,35 @@ capture_engine_output() {
   local mode="$2"
 
   if [ "$QUIET" = true ]; then
-    if [[ "$mode" == "verify" && "$ENGINE" == "codex" ]]; then
+    if [[ "$ENGINE" == "codex" ]]; then
       # O stream completo continua no log. No terminal quiet, exponha somente
       # os metadados efetivos do cabecalho Codex necessarios para auditoria.
-      tee "$log_file" | awk '
+      tee -a "$log_file" | awk '
         /^model: / && !model_seen { print; fflush(); model_seen = 1 }
         /^reasoning effort: / && !reasoning_seen { print; fflush(); reasoning_seen = 1 }
       '
     else
-      cat > "$log_file"
+      cat >> "$log_file"
     fi
   else
-    tee "$log_file"
+    tee -a "$log_file"
   fi
+}
+
+announce_engine_session() {
+  local log_file="$1"
+  local mode="$2"
+  local sandbox="$3"
+  local model_label="$4"
+  local reasoning_label="$5"
+  local session_label="Implementacao/correcao"
+
+  if [[ "$mode" == "verify" ]]; then
+    session_label="Gate 3"
+  fi
+
+  printf '%s — gravando | engine: %s | modelo: %s | reasoning: %s | sandbox: %s | log: %s\n' \
+    "$session_label" "$ENGINE" "$model_label" "$reasoning_label" "$sandbox" "$log_file"
 }
 
 run_engine() {
@@ -1149,6 +1166,40 @@ run_engine() {
   export RALPH_PHASE_MAX_ATTEMPTS="$MAX_CYCLES"
 
   local model_args=() reasoning_args=()
+  local session_model="herdado" session_reasoning="herdado" session_sandbox="n/a"
+
+  if [[ "$mode" == "impl" ]]; then
+    if [ -n "$MODEL" ]; then
+      session_model="$MODEL"
+    fi
+    if [[ "$ENGINE" == "claude" ]]; then
+      session_reasoning="nao aplicavel"
+    elif [ -n "$REASONING" ]; then
+      session_reasoning="$REASONING"
+    fi
+  else
+    if [ -n "$VERIFY_MODEL" ]; then
+      session_model="$VERIFY_MODEL"
+    fi
+    if [[ "$ENGINE" == "claude" ]]; then
+      session_reasoning="nao aplicavel"
+    elif [ -n "$VERIFY_REASONING" ]; then
+      session_reasoning="$VERIFY_REASONING"
+    fi
+  fi
+
+  if [[ "$ENGINE" == "codex" ]]; then
+    if [[ "$mode" == "verify" ]]; then
+      session_sandbox="read-only"
+    elif is_system4u_profile; then
+      session_sandbox="workspace-write"
+    else
+      session_sandbox="danger-full-access"
+    fi
+  else
+    session_sandbox="dangerously-skip-permissions"
+  fi
+
   if [[ "$mode" == "impl" ]] && [ -n "$MODEL" ]; then
     model_args=(--model "$MODEL")
   elif [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
@@ -1162,6 +1213,8 @@ run_engine() {
 
   while true; do
     local rc=0
+    : > "$log_file"
+    announce_engine_session "$log_file" "$mode" "$session_sandbox" "$session_model" "$session_reasoning"
 
     if [[ "$ENGINE" == "codex" ]]; then
       if [[ "$mode" == "verify" ]]; then

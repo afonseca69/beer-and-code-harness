@@ -54,6 +54,28 @@ Commands are namespaced: `/bc-harness:init`, `/bc-harness:plan`, etc. (abbreviat
 - Claude engine: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
 - Root of a git repository with a **clean** working tree
 
+### Mutable session configuration
+
+Implementation/correction sessions accept `--model` / `RALPH_MODEL` and
+`--reasoning` / `RALPH_REASONING`. Precedence is flag > environment > engine
+inheritance. Codex accepts `minimal`, `low`, `medium`, `high`, or `xhigh` for
+reasoning. Claude accepts an explicit model, but reasoning is not applicable.
+
+Gate 3 keeps its own `--verify-model` / `--verify-reasoning` controls and stays
+separate from implementation sessions. Before each mutable session, ralph
+prints the requested configuration, sandbox, and log path. In Codex `--quiet`,
+the effective `model:` and `reasoning effort:` lines are still mirrored for
+both implementation and verification while the full header remains in the log.
+
+Approved example using Luna/xhigh on both mutable sessions:
+
+```bash
+scripts/ralph.sh --engine codex --quiet \
+  --model gpt-5.6-luna --reasoning xhigh \
+  --verify-model gpt-5.6-luna --verify-reasoning xhigh \
+  .spec/features/<slug>/PHASES.md
+```
+
 ## Commands
 
 ### `/init` — init chain router

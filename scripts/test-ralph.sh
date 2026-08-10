@@ -58,6 +58,7 @@ state="${MOCK_STATE:?}"
 scenario="${MOCK_SCENARIO:-ok}"
 prompt=""
 verify=0
+sandbox=""
 
 bump() {
   local f="$state/$1" n=0
@@ -87,7 +88,11 @@ else
   printf '%s\n' "$@" >> "$state/codex_args"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --sandbox) [ "$2" = "read-only" ] && verify=1; shift 2 ;;
+      --sandbox)
+        sandbox="$2"
+        [ "$2" = "read-only" ] && verify=1
+        shift 2
+        ;;
       --model) model="$2"; shift 2 ;;
       -c)
         if [[ "$2" == model_reasoning_effort=* ]]; then
@@ -237,6 +242,18 @@ case "$scenario" in
     fi
     ;;
 esac
+
+if [ "$name" = "codex" ]; then
+  echo "OpenAI Codex mock"
+  echo "--------"
+  echo "model: ${model:-gpt-mock-inherited}"
+  echo "provider: mock"
+  echo "approval: never"
+  echo "sandbox: ${sandbox:-danger-full-access}"
+  echo "reasoning effort: ${reasoning:-medium}"
+  echo "reasoning summaries: none"
+  echo "--------"
+fi
 
 # stall-after-red: escreve no 1o ciclo (teste vermelho), depois trava sem
 # escrever nada. already-done: o codigo ja existe em HEAD, o engine nao escreve.
@@ -965,6 +982,26 @@ if case_enabled verify-runtime-quiet; then
   assert_contains "$d/repo/.phases/logs/phase-01.verify-1.log" "OpenAI Codex mock" "log preserva inicio do cabecalho"
   assert_contains "$d/repo/.phases/logs/phase-01.verify-1.log" "provider: mock" "log preserva metadados integrais"
   assert_contains "$d/repo/.phases/logs/phase-01.verify-1.log" "reasoning summaries: none" "log preserva fim do cabecalho"
+fi
+
+# ---------------------------------------------------------------------------
+# 27b. Codex quiet na implementacao mostra config solicitada, runtime efetivo
+#      e mantem o cabecalho completo no log da fase.
+# ---------------------------------------------------------------------------
+if case_enabled impl-runtime-quiet; then
+  header "27b. runtime efetivo da implementacao aparece em quiet"
+  d=$(new_case impl-runtime-quiet)
+  use_single_phase_fixture "$d"
+  rc=$(run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh" --max-cycles 1 --quiet --model gpt-5.6-luna --reasoning xhigh --no-verify)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "Implementacao/correcao — gravando | engine: codex | modelo: gpt-5.6-luna | reasoning: xhigh | sandbox: danger-full-access | log: .phases/logs/phase-01.cycle-1.log" "inicio informa config solicitada, sandbox e log"
+  assert_contains "$d/out.log" "model: gpt-5.6-luna" "terminal mostra modelo efetivo na implementacao"
+  assert_contains "$d/out.log" "reasoning effort: xhigh" "terminal mostra reasoning efetivo na implementacao"
+  assert_not_contains "$d/out.log" "provider: mock" "quiet nao espelha o cabecalho inteiro na implementacao"
+  assert_contains "$d/repo/.phases/logs/phase-01.cycle-1.log" "OpenAI Codex mock" "log preserva inicio do cabecalho da implementacao"
+  assert_contains "$d/repo/.phases/logs/phase-01.cycle-1.log" "provider: mock" "log preserva metadados integrais da implementacao"
+  assert_contains "$d/repo/.phases/logs/phase-01.cycle-1.log" "reasoning summaries: none" "log preserva fim do cabecalho da implementacao"
+  assert_contains "$d/state/codex_args" "danger-full-access" "implementacao default usa danger-full-access"
 fi
 
 # ---------------------------------------------------------------------------

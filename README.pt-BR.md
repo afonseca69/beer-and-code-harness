@@ -52,6 +52,29 @@ O `ralph.sh` é um script bash independente — copie ou referencie `scripts/ral
 - Engine Claude: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
 - Raiz de um repositório git com árvore de trabalho **limpa**
 
+### Configuracao das sessoes mutaveis
+
+As sessoes de implementacao/correcao aceitam `--model` / `RALPH_MODEL` e
+`--reasoning` / `RALPH_REASONING`. A precedencia e flag > ambiente > heranca
+do engine. O Codex aceita `minimal`, `low`, `medium`, `high` ou `xhigh` como
+reasoning. O Claude aceita modelo explicito, mas reasoning nao e aplicavel.
+
+O Gate 3 continua com `--verify-model` / `--verify-reasoning` proprios e
+permanece separado das sessoes de implementacao. Antes de cada sessao mutavel,
+o ralph imprime a configuracao solicitada, o sandbox e o caminho do log. No
+Codex `--quiet`, as linhas efetivas `model:` e `reasoning effort:` tambem sao
+espelhadas tanto na implementacao quanto na verificacao, enquanto o cabecalho
+completo fica preservado no log.
+
+Exemplo aprovado usando Luna/xhigh nas duas sessoes mutaveis:
+
+```bash
+scripts/ralph.sh --engine codex --quiet \
+  --model gpt-5.6-luna --reasoning xhigh \
+  --verify-model gpt-5.6-luna --verify-reasoning xhigh \
+  .spec/features/<slug>/PHASES.md
+```
+
 ## Comandos
 
 ### `/init` — roteador da cadeia init
