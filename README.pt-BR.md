@@ -1,6 +1,6 @@
 # Beer and Code Harness (`bc-harness`)
 
-Plugin de [Claude Code](https://claude.com/claude-code) com comandos, agentes e scripts para levar um projeto da ideia à implementação de forma estruturada: especificação formal, planejamento em fases e execução autônoma com validação mecânica — sem abrir mão do controle humano nos pontos de decisão.
+Harness para [Claude Code](https://claude.com/claude-code) & Codex CLI com comandos, agentes e scripts para levar um projeto da ideia à implementação de forma estruturada: especificação formal, planejamento em fases e execução autônoma com validação mecânica — sem abrir mão do controle humano nos pontos de decisão.
 
 O harness é **agnóstico de stack**: quem define linguagem, framework, comandos e convenções são os documentos do próprio projeto (`AGENTS.md`, `CLAUDE.md`, cadeia `.spec/`), nunca o harness.
 
@@ -36,20 +36,74 @@ Transversal a tudo: **`/ai-context`** mantém a árvore de contexto (`AGENTS.md`
 
 ## Instalação
 
-O repositório é um plugin de Claude Code (`.claude-plugin/plugin.json`). Instale via marketplace/caminho local conforme sua configuração de plugins:
+A interface de comandos é distribuída como plugin do [Claude Code](https://code.claude.com/docs/en/setup) (`.claude-plugin/plugin.json`). O executor autônomo oferece suporte a Claude Code e [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) por meio de `scripts/ralph.sh`.
 
+### Plugin do Claude Code
+
+Instale o Claude Code via npm, depois rode `claude` a partir do diretório de um projeto e conclua um método de autenticação compatível:
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude
 ```
-/plugin install bc-harness
+
+Depois que o Claude Code estiver autenticado, instale o marketplace público hospedado em [`afonseca69/beer-and-code-harness`](https://github.com/afonseca69/beer-and-code-harness) e, em seguida, instale o plugin `bc-harness` a partir do marketplace `beer-and-code-local`:
+
+```bash
+claude plugin marketplace add afonseca69/beer-and-code-harness
+claude plugin install bc-harness@beer-and-code-local
 ```
 
-Os comandos ficam disponíveis com namespace: `/bc-harness:init`, `/bc-harness:plan`, etc. (nesta documentação, abreviados sem o namespace).
+Dentro de uma sessão interativa do Claude Code, os comandos equivalentes são:
 
-O `ralph.sh` é um script bash independente — copie ou referencie `scripts/ralph.sh` e rode direto no repositório do projeto-alvo.
+```text
+/plugin marketplace add afonseca69/beer-and-code-harness
+/plugin install bc-harness@beer-and-code-local
+```
 
-**Pré-requisitos do ralph.sh:**
+Se o Claude informar `Run /reload-plugins to activate.`, rode `/reload-plugins`.
 
-- Engine Codex: `rtk` + `npm install -g @openai/codex` + `OPENAI_API_KEY` (o ralph executa `rtk codex exec`)
-- Engine Claude: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
+Os comandos ficam disponíveis com namespace: `/bc-harness:init`, `/bc-harness:plan`, etc. (nesta documentação, abreviados sem o namespace). Esses slash commands são comandos do plugin Claude Code; o suporte a Codex neste repositório é o executor `scripts/ralph.sh`.
+
+### Executor com Codex CLI
+
+Instale o Codex CLI com o instalador oficial para macOS/Linux, ou via npm:
+
+```bash
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+# ou
+npm install -g @openai/codex
+```
+
+Depois, rode `codex` a partir do diretório de um projeto e autentique com ChatGPT ou outro método compatível:
+
+```bash
+codex
+```
+
+Instale o RTK (Rust Token Killer) e verifique se o comando `rtk` é o otimizador de tokens esperado:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/master/install.sh | sh
+rtk gain
+```
+
+Execute o `ralph.sh` tendo a raiz do repositório do projeto-alvo como diretório atual. Você pode copiar `scripts/ralph.sh` para o projeto-alvo ou invocá-lo pelo caminho do clone do harness, absoluto ou relativo.
+
+```bash
+# a partir da raiz limpa do projeto-alvo, usando o clone do harness
+/caminho/para/beer-and-code-harness/scripts/ralph.sh --engine codex .spec/features/<slug>/PHASES.md
+
+# se scripts/ralph.sh foi copiado para o projeto-alvo
+scripts/ralph.sh --engine codex .spec/features/<slug>/PHASES.md
+```
+
+`OPENAI_API_KEY` é suportada pela autenticação do Codex CLI, mas não é um pré-requisito obrigatório do `ralph.sh` quando o Codex já está autenticado por ChatGPT ou outro método compatível. O engine Codex exige `rtk` e `codex` no `PATH`; o ralph executa `rtk codex exec`.
+
+### Pré-requisitos do ralph.sh
+
+- Engine Codex: [RTK](https://github.com/rtk-ai/rtk) + Codex CLI autenticado e disponível no `PATH`
+- Engine Claude: Claude Code CLI autenticado e disponível no `PATH`
 - Raiz de um repositório git com árvore de trabalho **limpa**
 
 ### Configuracao das sessoes mutaveis

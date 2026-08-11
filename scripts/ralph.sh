@@ -145,8 +145,8 @@
 # Exit code: 0 = todas as fases verdes; 1 = alguma falhou ou abortou.
 #
 # Pre-requisitos:
-#   - Codex: rtk + npm install -g @openai/codex + OPENAI_API_KEY
-#   - Claude: npm install -g @anthropic-ai/claude-code + ANTHROPIC_API_KEY
+#   - Codex: rtk e codex autenticado no PATH (ChatGPT ou outro metodo suportado)
+#   - Claude: claude autenticado no PATH
 #   - Raiz de um repo git, com a arvore de trabalho limpa
 # Fim do help
 
