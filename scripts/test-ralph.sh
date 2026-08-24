@@ -41,6 +41,11 @@ assert_not_contains() {
   if grep -qF -- "$needle" "$haystack_file"; then bad "$msg (achou '$needle')"; else ok "$msg"; fi
 }
 
+assert_le() {
+  local actual="$1" maximum="$2" msg="$3"
+  if [ "$actual" -le "$maximum" ]; then ok "$msg"; else bad "$msg (maximo '$maximum', veio '$actual')"; fi
+}
+
 # ---------------------------------------------------------------------------
 # Mock engine — vale para claude e codex (dispatch por basename)
 # ---------------------------------------------------------------------------
@@ -332,11 +337,32 @@ make_testcmd() {
 set -uo pipefail
 state="${MOCK_STATE:?}"
 scenario="${MOCK_SCENARIO:-ok}"
+kind=$(basename "$0" .sh)
 # sail test real (docker compose exec) anexa stdin: mesmo risco do claude -p.
 [ -t 0 ] || cat > /dev/null
-f="$state/test_calls"; n=0
+counter="test_calls"
+[ "$kind" = "focused" ] && counter="focused_test_calls"
+[ "$kind" = "final" ] && counter="final_test_calls"
+f="$state/$counter"; n=0
 [ -f "$f" ] && n=$(cat "$f")
 n=$((n + 1)); echo "$n" > "$f"
+
+if [ "$scenario" = "large-test-output" ] && [ "$n" -eq 1 ]; then
+  printf 'FAILED HugeSnapshotTest: '
+  head -c 150000 /dev/zero | tr '\0' 'X'
+  printf '\nIMPORTANT_FAILURE_MARKER\nTests: 1 failed, 10 passed\n'
+  exit 1
+fi
+
+if [ "$scenario" = "staged-focused-red-once" ] && [ "$kind" = "focused" ] && [ "$n" -eq 1 ]; then
+  echo "1 failing focused test: FocusedExpectedFooTest"
+  exit 1
+fi
+
+if [ "$scenario" = "staged-final-red-once" ] && [ "$kind" = "final" ] && [ "$n" -eq 1 ]; then
+  echo "1 failing final test: FinalRegressionTest"
+  exit 1
+fi
 
 if [ "$scenario" = "test-red-once" ] || [ "$scenario" = "stall-after-red" ] || [ "$scenario" = "gate-progress" ]; then
   if [ "$n" -eq 1 ]; then
@@ -433,6 +459,28 @@ SAILMOCK
   chmod +x "$repo/vendor/bin/sail"
 }
 
+# Wrapper local que seleciona o service Compose real do projeto antes de
+# delegar comandos. Projetos podem manter vendor/bin/sail instalado e ainda
+# exigir este wrapper para sobrescrever APP_SERVICE/APP_USER.
+make_project_sail_wrapper() {
+  local repo="$1"
+
+  cat > "$repo/sail" <<'SAILWRAPPER'
+#!/usr/bin/env bash
+set -uo pipefail
+if [ "${1:-}" = "ps" ]; then
+  echo "NAME            IMAGE            STATUS"
+  echo "portalxml-app   portalxml-app    Up 2 hours"
+  exit 0
+fi
+if [ "${1:-}" = "test" ]; then
+  exec "$MOCK_TEST_CMD"
+fi
+exit 0
+SAILWRAPPER
+  chmod +x "$repo/sail"
+}
+
 # new_case <nome> -> ecoa o diretorio do repo fixture
 new_case() {
   local name="$1"
@@ -440,6 +488,8 @@ new_case() {
   mkdir -p "$dir/repo" "$dir/state" "$dir/bin"
   make_mocks "$dir/bin"
   make_testcmd "$dir/test.sh"
+  cp "$dir/test.sh" "$dir/focused.sh"
+  cp "$dir/test.sh" "$dir/final.sh"
 
   (
     cd "$dir/repo" || exit 1
@@ -478,6 +528,9 @@ run_ralph() {
     RALPH_LIMIT_BUFFER=1 \
     RALPH_MODEL="${CASE_MODEL:-}" \
     RALPH_REASONING="${CASE_REASONING:-}" \
+    RALPH_FIX_REASONING="${CASE_FIX_REASONING:-}" \
+    RALPH_FOCUSED_TEST_CMD="${CASE_FOCUSED_TEST_CMD:-}" \
+    RALPH_FINAL_TEST_CMD="${CASE_FINAL_TEST_CMD:-}" \
     RALPH_VERIFY="${CASE_VERIFY:-}" \
     RALPH_VERIFY_MODEL="${CASE_VERIFY_MODEL:-}" \
     RALPH_VERIFY_REASONING="${CASE_VERIFY_REASONING:-}" \
@@ -1183,6 +1236,24 @@ if case_enabled sail-up; then
 fi
 
 # ---------------------------------------------------------------------------
+# 13a. Wrapper Sail local tem precedencia sobre vendor/bin/sail. Isso preserva
+#      overrides de APP_SERVICE/APP_USER definidos pelo proprio projeto.
+# ---------------------------------------------------------------------------
+if case_enabled sail-project-wrapper; then
+  header "13a. wrapper Sail do projeto tem precedencia"
+  d=$(new_case sail-project-wrapper)
+  make_sail_fixture "$d/repo" up
+  make_project_sail_wrapper "$d/repo"
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: project sail wrapper"
+  rc=$(run_ralph "$d" ok --engine claude)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "comando de teste (detectado): ./sail test" "preferiu o wrapper local"
+  assert_not_contains "$d/out.log" "comando de teste (detectado): vendor/bin/sail test" "nao ignorou overrides do projeto"
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "./sail test" "prompt informa o wrapper correto"
+  assert_eq 2 "$(cat "$d/state/test_calls")" "suite rodou pelo wrapper local em cada fase"
+fi
+
+# ---------------------------------------------------------------------------
 # 14. Sail com containers parados -> abort no preflight, zero tokens
 # ---------------------------------------------------------------------------
 if case_enabled sail-down; then
@@ -1330,6 +1401,171 @@ if case_enabled impl-preflight; then
   assert_eq 1 "$rc" "reasoning Claude por ambiente falha"
   assert_contains "$d5/out.log" "Remova --reasoning/RALPH_REASONING" "erro de ambiente Claude orienta a remocao"
   test -f "$d5/state/impl_calls" && bad "reasoning Claude por ambiente nao inicia implementacao" || ok "reasoning Claude por ambiente nao inicia implementacao"
+fi
+
+# ---------------------------------------------------------------------------
+# 37. Gate 2 em estagios: teste focado falha antes da suite final; quando o
+#     foco fica verde, a suite final roda uma unica vez antes do Gate 3.
+# ---------------------------------------------------------------------------
+if case_enabled staged-tests; then
+  header "37. gate 2 focado antecede a suite final"
+  d=$(new_case staged-tests)
+  use_single_phase_fixture "$d"
+  rc=$(run_ralph "$d" staged-focused-red-once --engine claude --max-cycles 2 \
+    --focused-test-cmd "$d/focused.sh" --final-test-cmd "$d/final.sh")
+  assert_eq 0 "$rc" "fase conclui depois da correcao focada"
+  assert_eq 2 "$(cat "$d/state/focused_test_calls")" "teste focado roda em cada ciclo"
+  assert_eq 1 "$(cat "$d/state/final_test_calls")" "suite final so roda depois do foco verde"
+  assert_contains "$d/out.log" "Gate 2a vermelho" "falha focada e identificada separadamente"
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-2.txt" "FocusedExpectedFooTest" "corretor recebe a falha focada"
+  assert_contains "$d/repo/.phases/prompts/phase-01.verify-2.txt" "Gate 2a verde" "verificador recebe evidencia do gate focado"
+  assert_contains "$d/repo/.phases/prompts/phase-01.verify-2.txt" "Gate 2b verde" "verificador recebe evidencia da suite final"
+
+  d2=$(new_case staged-final-red)
+  use_single_phase_fixture "$d2"
+  rc=$(run_ralph "$d2" staged-final-red-once --engine claude --max-cycles 2 \
+    --focused-test-cmd "$d2/focused.sh" --final-test-cmd "$d2/final.sh")
+  assert_eq 0 "$rc" "regressao final abre correcao e depois conclui"
+  assert_eq 2 "$(cat "$d2/state/focused_test_calls")" "foco e revalidado depois da correcao final"
+  assert_eq 2 "$(cat "$d2/state/final_test_calls")" "suite final e revalidada depois de falhar"
+  assert_contains "$d2/out.log" "Gate 2b vermelho" "falha da suite final e identificada separadamente"
+
+  d3=$(new_case staged-legacy-final)
+  use_single_phase_fixture "$d3"
+  rc=$(run_ralph "$d3" staged-focused-red-once --engine claude --max-cycles 2 \
+    --focused-test-cmd "$d3/focused.sh" --test-cmd "$d3/final.sh")
+  assert_eq 0 "$rc" "test-cmd legado serve como suite final quando o foco e configurado"
+  assert_eq 2 "$(cat "$d3/state/focused_test_calls")" "fallback legado preserva o gate focado por ciclo"
+  assert_eq 1 "$(cat "$d3/state/final_test_calls")" "fallback legado executa a suite final uma vez"
+
+  d4=$(new_case staged-focused-missing)
+  rc=$(run_ralph "$d4" ok --engine claude --focused-test-cmd --max-cycles 1)
+  assert_eq 1 "$rc" "teste focado sem argumento falha no preflight"
+  assert_contains "$d4/out.log" "--focused-test-cmd exige um comando nao vazio" "erro de teste focado ausente e claro"
+
+  d5=$(new_case staged-final-missing)
+  rc=$(run_ralph "$d5" ok --engine claude --final-test-cmd --max-cycles 1)
+  assert_eq 1 "$rc" "suite final sem argumento falha no preflight"
+  assert_contains "$d5/out.log" "--final-test-cmd exige um comando nao vazio" "erro de suite final ausente e claro"
+fi
+
+# ---------------------------------------------------------------------------
+# 38. A causa enviada ao corretor e limitada mesmo quando um framework emite
+#     uma unica linha gigantesca (por exemplo, snapshot Livewire serializado).
+# ---------------------------------------------------------------------------
+if case_enabled bounded-failure; then
+  header "38. causa de teste gigantesca e limitada"
+  d=$(new_case bounded-failure)
+  use_single_phase_fixture "$d"
+  rc=$(run_ralph "$d" large-test-output --engine claude --test-cmd "$d/test.sh" --max-cycles 2)
+  assert_eq 0 "$rc" "fase corrige depois do output gigantesco"
+  prompt="$d/repo/.phases/prompts/phase-01.cycle-2.txt"
+  assert_le "$(wc -c < "$prompt")" 30000 "prompt corretivo permanece limitado"
+  assert_contains "$prompt" "IMPORTANT_FAILURE_MARKER" "resumo preserva o marcador final relevante"
+  assert_contains "$prompt" "saida limitada pelo Ralph" "truncamento fica explicito"
+fi
+
+# ---------------------------------------------------------------------------
+# 39. Correcoes usam contexto enxuto e reasoning independente, mantendo o
+#     reasoning de implementacao inicial e do Gate 3 separados.
+# ---------------------------------------------------------------------------
+if case_enabled fix-runtime; then
+  header "39. correcao tem contexto e reasoning proprios"
+  d=$(new_case fix-runtime)
+  use_single_phase_fixture "$d"
+  rc=$(run_ralph "$d" test-red-once --engine codex --test-cmd "$d/test.sh" --max-cycles 2 \
+    --reasoning xhigh --fix-reasoning high --verify-reasoning xhigh)
+  assert_eq 0 "$rc" "fase conclui com reasoning corretivo separado"
+  assert_eq $'<inherited>|xhigh\n<inherited>|high' "$(cat "$d/state/impl_configs")" "implementacao e correcao recebem esforços distintos"
+  prompt="$d/repo/.phases/prompts/phase-01.cycle-2.txt"
+  assert_contains "$prompt" "Contexto enxuto de correcao" "corretor recebe preambulo especifico"
+  assert_contains "$prompt" "Nao releia logs historicos" "corretor nao reprocessa logs antigos"
+  assert_not_contains "$prompt" ".spec/init/project-description.md" "corretor nao recebe roteiro de descoberta integral"
+  assert_not_contains "$prompt" "saida limitada pelo Ralph" "log pequeno nao recebe aviso falso de truncamento"
+  verify_prompt="$d/repo/.phases/prompts/phase-01.verify-2.txt"
+  assert_contains "$verify_prompt" "Log focado: nenhum" "gate legado nao e rotulado como teste focado"
+  assert_contains "$verify_prompt" "Log final: .phases/logs/phase-01.test-2.log" "gate legado informa o log autoritativo ao verificador"
+
+  d2=$(new_case fix-runtime-claude)
+  rc=$(run_ralph "$d2" ok --engine claude --test-cmd "$d2/test.sh" --fix-reasoning high)
+  assert_eq 1 "$rc" "reasoning corretivo explicito e rejeitado no Claude"
+  assert_contains "$d2/out.log" "Reasoning de correcao nao e compativel com o engine Claude" "erro de compatibilidade e claro"
+
+  d3=$(new_case fix-runtime-env)
+  use_single_phase_fixture "$d3"
+  rc=$(CASE_REASONING=xhigh CASE_FIX_REASONING=high run_ralph "$d3" test-red-once \
+    --engine codex --test-cmd "$d3/test.sh" --max-cycles 2)
+  assert_eq 0 "$rc" "reasoning corretivo por ambiente e aplicado"
+  assert_eq $'<inherited>|xhigh\n<inherited>|high' "$(cat "$d3/state/impl_configs")" "ambiente separa implementacao de correcao"
+
+  d4=$(new_case fix-runtime-invalid)
+  rc=$(run_ralph "$d4" ok --engine codex --test-cmd "$d4/test.sh" --fix-reasoning turbo)
+  assert_eq 1 "$rc" "reasoning corretivo invalido falha no preflight"
+  assert_contains "$d4/out.log" "Reasoning invalido para os ciclos corretivos Codex" "erro corretivo lista os esforcos aceitos"
+  test -f "$d4/state/impl_calls" && bad "reasoning corretivo invalido nao inicia implementacao" || ok "reasoning corretivo invalido nao inicia implementacao"
+fi
+
+# ---------------------------------------------------------------------------
+# 40. Selecao de fase impede que o Ralph inicie automaticamente trabalho nao
+#     solicitado depois de concluir a unidade observada.
+# ---------------------------------------------------------------------------
+if case_enabled phase-selection; then
+  header "40. only-phase e stop-after encerram no limite pedido"
+  d=$(new_case only-phase)
+  rc=$(run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --only-phase 2)
+  assert_eq 0 "$rc" "only-phase conclui a fase selecionada"
+  assert_eq 1 "$(cat "$d/state/impl_calls")" "only-phase inicia uma unica sessao de implementacao"
+  assert_not_contains "$d/repo/.phases/.progress" "phase-01.md" "only-phase nao marca fase anterior"
+  assert_contains "$d/repo/.phases/.progress" "phase-02.md" "only-phase marca a fase selecionada"
+  assert_eq "feat(phase-2): Feature" "$(git -C "$d/repo" log -1 --pretty=%s)" "only-phase commita a fase correta"
+
+  d2=$(new_case stop-after)
+  rc=$(run_ralph "$d2" ok --engine claude --test-cmd "$d2/test.sh" --stop-after 1)
+  assert_eq 0 "$rc" "stop-after encerra o run com sucesso"
+  assert_eq 1 "$(cat "$d2/state/impl_calls")" "stop-after nao inicia a fase seguinte"
+  assert_contains "$d2/repo/.phases/.progress" "phase-01.md" "stop-after preserva o progresso concluido"
+  assert_not_contains "$d2/repo/.phases/.progress" "phase-02.md" "stop-after deixa a fase seguinte pendente"
+  assert_contains "$d2/out.log" "Parada solicitada apos a Phase 1" "parada e observavel no relatorio"
+
+  d3=$(new_case phase-selection-conflict)
+  rc=$(run_ralph "$d3" ok --engine claude --test-cmd "$d3/test.sh" --only-phase 1 --stop-after 1)
+  assert_eq 1 "$rc" "only-phase e stop-after juntos falham no preflight"
+  assert_contains "$d3/out.log" "--only-phase nao pode ser combinado" "conflito de selecao e explicado"
+  test -f "$d3/state/impl_calls" && bad "conflito de selecao nao inicia implementacao" || ok "conflito de selecao nao inicia implementacao"
+
+  d4=$(new_case phase-selection-missing)
+  rc=$(run_ralph "$d4" ok --engine claude --test-cmd "$d4/test.sh" --only-phase 99)
+  assert_eq 1 "$rc" "fase inexistente falha antes da implementacao"
+  assert_contains "$d4/out.log" "--only-phase 99 nao existe" "fase inexistente e identificada"
+  test -f "$d4/state/impl_calls" && bad "fase inexistente nao inicia implementacao" || ok "fase inexistente nao inicia implementacao"
+
+  d5=$(new_case phase-selection-only-missing)
+  rc=$(run_ralph "$d5" ok --engine claude --test-cmd "$d5/test.sh" --only-phase --quiet)
+  assert_eq 1 "$rc" "only-phase sem argumento falha no preflight"
+  assert_contains "$d5/out.log" "Valor invalido para --only-phase" "erro de only-phase ausente e claro"
+
+  d6=$(new_case phase-selection-stop-missing)
+  rc=$(run_ralph "$d6" ok --engine claude --test-cmd "$d6/test.sh" --stop-after --quiet)
+  assert_eq 1 "$rc" "stop-after sem argumento falha no preflight"
+  assert_contains "$d6/out.log" "Valor invalido para --stop-after" "erro de stop-after ausente e claro"
+fi
+
+# ---------------------------------------------------------------------------
+# 41. O help deve publicar os novos controles para que automacoes nao dependam
+#     de comportamento implicito.
+# ---------------------------------------------------------------------------
+if case_enabled runtime-help; then
+  header "41. help publica controles de runtime enxuto"
+  help_log="$TMP/runtime-help.log"
+  bash "$RALPH" --help > "$help_log"
+  assert_contains "$help_log" "--focused-test-cmd" "help lista gate focado"
+  assert_contains "$help_log" "--final-test-cmd" "help lista suite final"
+  assert_contains "$help_log" "--fix-reasoning" "help lista reasoning corretivo"
+  assert_contains "$help_log" "--only-phase" "help lista selecao unica"
+  assert_contains "$help_log" "--stop-after" "help lista parada apos fase"
+  assert_contains "$help_log" "RALPH_FOCUSED_TEST_CMD" "help lista env de teste focado"
+  assert_contains "$help_log" "RALPH_FINAL_TEST_CMD" "help lista env de suite final"
+  assert_contains "$help_log" "RALPH_FIX_REASONING" "help lista env de reasoning corretivo"
 fi
 
 # ---------------------------------------------------------------------------

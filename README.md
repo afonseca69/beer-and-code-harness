@@ -114,6 +114,8 @@ Implementation/correction sessions accept `--model` / `RALPH_MODEL` and
 `--reasoning` / `RALPH_REASONING`. Precedence is flag > environment > engine
 inheritance. Codex accepts `minimal`, `low`, `medium`, `high`, or `xhigh` for
 reasoning. Claude accepts an explicit model, but reasoning is not applicable.
+Correction cycles may override only their effort with `--fix-reasoning` /
+`RALPH_FIX_REASONING`; without it, they inherit the implementation reasoning.
 
 Gate 3 keeps its own `--verify-model` / `--verify-reasoning` controls and stays
 separate from implementation sessions. Before each mutable session, ralph
@@ -121,12 +123,15 @@ prints the requested configuration, sandbox, and log path. In Codex `--quiet`,
 the effective `model:` and `reasoning effort:` lines are still mirrored for
 both implementation and verification while the full header remains in the log.
 
-Approved example using Luna/xhigh on both mutable sessions:
+Runtime-conscious example: Luna/high for implementation and corrections,
+xhigh only for the independent verifier, three cycles at most, and one selected
+phase:
 
 ```bash
 scripts/ralph.sh --engine codex --quiet \
-  --model gpt-5.6-luna --reasoning xhigh \
+  --model gpt-5.6-luna --reasoning high --fix-reasoning high \
   --verify-model gpt-5.6-luna --verify-reasoning xhigh \
+  --max-cycles 3 --only-phase 2 \
   .spec/features/<slug>/PHASES.md
 ```
 
@@ -251,10 +256,10 @@ The allowlist is line-based: exact files or directory prefixes ending in `/`; bl
 |---|---|---|
 | 0 | Did the engine actually finish? | claude: `is_error` in the result JSON; codex: exit code |
 | 1 | Did the session write code? | Tree signature before/after. **A signal, not a verdict** — an already-implemented phase makes the engine (correctly) write nothing; the signal feeds the fix-cycle cause |
-| 2 | Does the test suite pass? | Run **by ralph itself**, outside the agent session — the agent cannot "fake green" |
-| 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); on the claude engine it uses a cheap model (haiku) |
+| 2 | Do the configured tests pass? | Run **by ralph itself on the host**, outside the agent session. With staged commands, Gate 2a runs focused tests each cycle and Gate 2b runs the final suite only after 2a is green |
+| 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. It receives Gate 2's authoritative result and log paths, and runs on every phase by default (`RALPH_VERIFY=always`); on the Claude engine it uses a cheap model (haiku) |
 
-Any red gate → **fix cycle**: a fresh session receives the full phase + the real failure cause (never a generic "tests failed"). The default hard cap is **12 total cycles per phase**, including the initial implementation; `--max-cycles` or `RALPH_MAX_CYCLES` set a different explicit limit.
+Any red gate → **fix cycle**: a fresh session receives the full phase + a bounded excerpt of the real failure cause (never a generic "tests failed"). Correction prompts use the current phase, changed paths, and directly related evidence instead of replaying historical logs and the entire discovery chain. The default hard cap remains **12 total cycles per phase** for compatibility; use `--max-cycles 3` for a tighter runtime budget.
 
 The first failure is the progress reference. A consecutive repetition of the same gate + normalized cause + tree signature increments stagnation; a different gate, finding, or tree resets the counter. The default `--max-stalled-cycles 2` stops after two consecutive corrective repetitions without progress. A phase therefore ends green, at the hard cap, on stagnation, or because an operational/guardrail/commit failure could not be corrected within those limits; preflight failures abort before the first session.
 
@@ -268,7 +273,7 @@ Verifier model and reasoning follow **flag > environment variable > inherited en
 
 Before each verification, the terminal records `gravando` (recording), engine, requested model/reasoning (or `herdado`/inherited and `nao aplicavel`/not applicable), the `read-only` sandbox, and the log path. This is the **requested configuration**. For Codex, the header emitted by the CLI reveals the **effective runtime**; its model and reasoning lines are mirrored to the terminal even with `--quiet`, while the complete header remains in the log.
 
-Artifacts are separated by phase and cycle under `.phases/logs/` by default, or `<run-dir>/logs/` with `system4u-autonomous`: `phase-NN.cycle-C.log` for implementation/fixes, `phase-NN.test-C.log` for Gate 2, and `phase-NN.verify-C.log` for Gate 3. Every Gate 3 run requires an existing, non-empty verification log; a missing or empty file leaves the gate red with an explicit operational cause and the corresponding path in the summary.
+Artifacts are separated by phase and cycle under `.phases/logs/` by default, or `<run-dir>/logs/` with `system4u-autonomous`: `phase-NN.cycle-C.log` for implementation/fixes, `phase-NN.focused-C.log` for staged Gate 2a, `phase-NN.test-C.log` for the legacy Gate 2 or staged Gate 2b, and `phase-NN.verify-C.log` for Gate 3. Every Gate 3 run requires an existing, non-empty verification log; a missing or empty file leaves the gate red with an explicit operational cause and the corresponding path in the summary.
 
 ### Functional versus operational authorization
 
@@ -278,9 +283,9 @@ This does not expand the agent's operational authorization. Project rules, sandb
 
 ### Test command detection (gate 2)
 
-First rule that resolves wins: `--test-cmd` → `RALPH_TEST_CMD` → manifest detection (Laravel Sail → `composer test` → `php artisan test` → `npm test` → `pytest` → `go test ./...` → `cargo test`) → nothing resolved = gate 2 skipped with a loud warning (gate 3 holds the line alone).
+The legacy/final command resolves as `--test-cmd` → `RALPH_TEST_CMD` → manifest detection (Laravel Sail → `composer test` → `php artisan test` → `npm test` → `pytest` → `go test ./...` → `cargo test`). Without a focused command it remains the single Gate 2. When `--focused-test-cmd` / `RALPH_FOCUSED_TEST_CMD` is set, it becomes Gate 2a and `--final-test-cmd` / `RALPH_FINAL_TEST_CMD` becomes Gate 2b; if no explicit final command is set, the legacy command is used as Gate 2b. A focused command without any resolvable final suite fails at preflight.
 
-Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail test`); stopped containers abort at preflight — every gate 2 would fail and burn fix cycles for nothing.
+Laravel Sail projects: Ralph invokes the Sail wrapper **from the host**, preferring an executable project wrapper (`./sail test`) before falling back to `vendor/bin/sail test`. This preserves project-defined service/user overrides while still running the suite inside the container. Stopped containers abort at preflight. The agent prompt is told not to retry Docker from a restricted sandbox or switch runners; the host-owned Gate 2 remains authoritative.
 
 ### Options and variables
 
@@ -288,12 +293,19 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 |---|---|
 | `--engine codex\|claude` | Implementation engine (default: `codex`) |
 | `--from N` | Starts at phase N (clears progress for phases ≥ N) |
+| `--only-phase N` | Runs only phase N and stops; cannot be combined with `--from` or `--stop-after` |
+| `--stop-after N` | Stops successfully after phase N is completed |
 | `--keep-going` | Continues after a phase fails (creates a `wip(phase-N)` commit; default: stop) |
 | `--max-cycles N` | Total hard cap per phase, including the initial implementation (default: 12) |
 | `--max-stalled-cycles N` | Consecutive corrective repetitions without progress after the first reference failure (default: 2) |
+| `--model MODEL` | Model for implementation and correction sessions; takes precedence over `RALPH_MODEL` |
+| `--reasoning EFFORT` | Codex reasoning for implementation and, by default, correction sessions |
+| `--fix-reasoning EFFORT` | Codex reasoning used only by correction cycles; takes precedence over `RALPH_FIX_REASONING` |
 | `--verify-model MODEL` | Gate 3 model; takes precedence over `RALPH_VERIFY_MODEL` |
 | `--verify-reasoning EFFORT` | Codex Gate 3 reasoning (`minimal\|low\|medium\|high\|xhigh`); takes precedence over `RALPH_VERIFY_REASONING` |
 | `--test-cmd "<cmd>"` | Project test command (gate 2) |
+| `--focused-test-cmd "<cmd>"` | Fast test command run as Gate 2a on every cycle |
+| `--final-test-cmd "<cmd>"` | Final suite run as Gate 2b after Gate 2a is green |
 | `--no-verify` | Disables gate 3 |
 | `-q`, `--quiet` | Hides raw Codex/Claude output from the terminal and prints a summary when each phase ends; full logs remain in the active artifact log directory |
 | `--profile system4u-autonomous` | Guarded non-interactive Codex profile: workspace-write, explicit allowlist, no WIP commits or destructive cleanup |
@@ -304,6 +316,11 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 | Variable | Effect |
 |---|---|
 | `RALPH_TEST_CMD` | Test command (gate 2) |
+| `RALPH_FOCUSED_TEST_CMD` | Focused test command (staged Gate 2a) |
+| `RALPH_FINAL_TEST_CMD` | Final test suite (staged Gate 2b) |
+| `RALPH_MODEL` | Model for implementation/correction sessions |
+| `RALPH_REASONING` | Codex reasoning for initial implementation and the correction fallback |
+| `RALPH_FIX_REASONING` | Codex reasoning used only on correction cycles |
 | `RALPH_VERIFY` | Gate 3: `always` (default) \| `auto` (saves tokens: only when gate 2's verdict isn't enough) \| `off` |
 | `RALPH_VERIFY_MODEL` | Verifier model (Claude default: `haiku`; inherited in Codex) |
 | `RALPH_VERIFY_REASONING` | Codex verifier reasoning; not applicable to Claude |
@@ -319,6 +336,8 @@ During each session, ralph exports `RALPH_ENGINE`, `RALPH_PHASE_TITLE`, `RALPH_P
 ### State and progress
 
 Internal work lives in `.phases/` (registered in `.git/info/exclude`, without touching the project's `.gitignore`): split phases, prompts, logs, manifest, and `.progress`. Progress survives across runs, but only for the **same input** (sha256 stamp) — a changed phase document resets progress.
+
+`--only-phase N` leaves other phase progress untouched. `--stop-after N` records every successfully completed phase through N and exits before starting the next one.
 
 Exit code: `0` = all phases green; `1` = some phase failed or aborted.
 

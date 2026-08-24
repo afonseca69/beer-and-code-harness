@@ -24,15 +24,20 @@
 # Opcoes:
 #   --engine codex|claude    engine de implementacao (default: codex)
 #   --from N                 comeca na fase N (limpa do progresso as fases >= N)
+#   --only-phase N           executa somente a fase N e para
+#   --stop-after N           para com sucesso depois de concluir a fase N
 #   --keep-going             continua apos uma fase falhar (default: para)
 #   --max-cycles N           hard cap total de ciclos por fase (default: 12)
 #   --max-stalled-cycles N   ciclos corretivos sem progresso (default: 2)
 #   --model MODEL            modelo das sessoes de implementacao/correcao
 #   --reasoning EFFORT       reasoning Codex das sessoes de implementacao/correcao
+#   --fix-reasoning EFFORT   reasoning Codex apenas dos ciclos de correcao
 #   --verify-model MODEL     modelo do verificador (flag > RALPH_VERIFY_MODEL)
 #   --verify-reasoning E     reasoning Codex: minimal|low|medium|high|xhigh
 #   --no-verify              desliga o gate 3 (equivale a RALPH_VERIFY=off)
 #   --test-cmd "<cmd>"       comando de teste do projeto (gate 2)
+#   --focused-test-cmd CMD   teste rapido executado em cada ciclo (gate 2a)
+#   --final-test-cmd CMD     suite completa apos o gate 2a verde (gate 2b)
 #   -q, --quiet              oculta o output dos engines; exibe um resumo por fase
 #   --profile NAME           perfil de execucao (default | system4u-autonomous)
 #   --allowed-paths-file P   allowlist obrigatoria no perfil system4u-autonomous
@@ -57,7 +62,8 @@
 #   1. a sessao escreveu codigo? SINAL, nao veredito — uma fase ja implementada
 #      faz o engine (corretamente) nao escrever nada. Alimenta a causa do ciclo
 #      de correcao quando um gate posterior reprova.
-#   2. suite de testes do projeto, rodada PELO ralph (fora da sessao do agente)
+#   2. testes rodados PELO ralph, fora da sessao: gate 2a focado por ciclo e,
+#      quando configurado, gate 2b completo somente depois do foco verde.
 #   3. sessao verificadora independente, read-only, task a task — o gate final,
 #      roda em toda fase (RALPH_VERIFY=always, default). RALPH_VERIFY=auto
 #      economiza: so roda quando o veredito do gate 2 nao basta — sessao que
@@ -80,6 +86,8 @@
 # Configuracao das sessoes mutaveis:
 #   - --model/--reasoning prevalecem sobre RALPH_MODEL/RALPH_REASONING;
 #     sem override, o engine herda a configuracao dele.
+#   - --fix-reasoning/RALPH_FIX_REASONING pode reduzir ou elevar somente os
+#     ciclos corretivos; sem override, herda --reasoning/RALPH_REASONING.
 #   - Codex aceita reasoning minimal|low|medium|high|xhigh.
 #   - Claude aceita modelo explicito, mas reasoning nao e aplicavel.
 #
@@ -103,11 +111,12 @@
 # Gates verdes com a arvore limpa => a fase ja estava implementada em HEAD:
 # marcada como feita, sem commit (nao ha o que commitar).
 #
-# Comando de teste (gate 2), primeira regra que resolver:
+# Comando base de teste (gate 2), primeira regra que resolver:
 #   1. --test-cmd "<cmd>"
 #   2. RALPH_TEST_CMD
 #   3. deteccao por manifest:
-#        Laravel Sail (artisan + vendor/bin/sail)  -> vendor/bin/sail test
+#        Laravel Sail (artisan + ./sail executavel) -> ./sail test
+#        Laravel Sail (artisan + vendor/bin/sail)   -> vendor/bin/sail test
 #        composer.json com scripts.test            -> composer test
 #        artisan                                   -> php artisan test
 #        package.json com scripts.test             -> npm test
@@ -116,14 +125,24 @@
 #        Cargo.toml                                -> cargo test
 #   4. nada resolvido -> aviso alto + gate 2 pulado (o gate 3 segura sozinho)
 #
+# Execucao em estagios (opt-in e retrocompativel):
+#   - --focused-test-cmd/RALPH_FOCUSED_TEST_CMD vira o gate 2a por ciclo.
+#   - --final-test-cmd/RALPH_FINAL_TEST_CMD vira o gate 2b; sem ele, o comando
+#     base acima e usado como suite final.
+#   - sem teste focado, --final-test-cmd (ou o comando base) preserva o gate 2
+#     unico executado em cada ciclo.
+#
 # Laravel Sail: a suite roda dentro do container, entao Sail tem precedencia
 # sobre `composer test`. Containers parados -> abort no preflight (todo gate 2
 # falharia, queimando ciclos de correcao).
 #
 # Variaveis de ambiente:
 #   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
+#   RALPH_FOCUSED_TEST_CMD   teste rapido por ciclo (gate 2a)
+#   RALPH_FINAL_TEST_CMD     suite completa depois do gate 2a (gate 2b)
 #   RALPH_MODEL              modelo das sessoes de implementacao/correcao
 #   RALPH_REASONING          reasoning Codex das sessoes de implementacao/correcao
+#   RALPH_FIX_REASONING      reasoning Codex apenas dos ciclos corretivos
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
 #   RALPH_VERIFY_MODEL       modelo do verificador (default: haiku no claude)
 #   RALPH_VERIFY_REASONING   reasoning do verificador Codex
@@ -155,8 +174,17 @@ set -euo pipefail
 ENGINE="codex"
 INPUT_FILE=""
 FROM_PHASE=0
+FROM_PHASE_FLAG_SET=false
+ONLY_PHASE=0
+ONLY_PHASE_FLAG_SET=false
+STOP_AFTER_PHASE=0
+STOP_AFTER_PHASE_FLAG_SET=false
 KEEP_GOING=false
 TEST_CMD_FLAG=""
+FOCUSED_TEST_CMD_FLAG=""
+FOCUSED_TEST_CMD_FLAG_SET=false
+FINAL_TEST_CMD_FLAG=""
+FINAL_TEST_CMD_FLAG_SET=false
 MAX_CYCLES="${RALPH_MAX_CYCLES:-12}"
 MAX_STALLED_CYCLES="${RALPH_MAX_STALLED_CYCLES:-2}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
@@ -166,6 +194,9 @@ MODEL_FLAG_SET=false
 REASONING=""
 REASONING_FLAG=""
 REASONING_FLAG_SET=false
+FIX_REASONING=""
+FIX_REASONING_FLAG=""
+FIX_REASONING_FLAG_SET=false
 VERIFY_MODEL=""
 VERIFY_MODEL_FLAG=""
 VERIFY_MODEL_FLAG_SET=false
@@ -182,8 +213,30 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --engine)      ENGINE="$2"; shift 2 ;;
     --engine=*)    ENGINE="${1#*=}"; shift ;;
-    --from)        FROM_PHASE="$2"; shift 2 ;;
-    --from=*)      FROM_PHASE="${1#*=}"; shift ;;
+    --from)        FROM_PHASE="$2"; FROM_PHASE_FLAG_SET=true; shift 2 ;;
+    --from=*)      FROM_PHASE="${1#*=}"; FROM_PHASE_FLAG_SET=true; shift ;;
+    --only-phase)
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        ONLY_PHASE=""
+        shift
+      else
+        ONLY_PHASE="$2"
+        shift 2
+      fi
+      ONLY_PHASE_FLAG_SET=true
+      ;;
+    --only-phase=*) ONLY_PHASE="${1#*=}"; ONLY_PHASE_FLAG_SET=true; shift ;;
+    --stop-after)
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        STOP_AFTER_PHASE=""
+        shift
+      else
+        STOP_AFTER_PHASE="$2"
+        shift 2
+      fi
+      STOP_AFTER_PHASE_FLAG_SET=true
+      ;;
+    --stop-after=*) STOP_AFTER_PHASE="${1#*=}"; STOP_AFTER_PHASE_FLAG_SET=true; shift ;;
     --max-cycles)  MAX_CYCLES="$2"; shift 2 ;;
     --max-cycles=*) MAX_CYCLES="${1#*=}"; shift ;;
     --max-stalled-cycles) MAX_STALLED_CYCLES="$2"; shift 2 ;;
@@ -210,12 +263,45 @@ while [[ $# -gt 0 ]]; do
       REASONING_FLAG_SET=true
       ;;
     --reasoning=*) REASONING_FLAG="${1#*=}"; REASONING_FLAG_SET=true; shift ;;
+    --fix-reasoning)
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        FIX_REASONING_FLAG=""
+        shift
+      else
+        FIX_REASONING_FLAG="$2"
+        shift 2
+      fi
+      FIX_REASONING_FLAG_SET=true
+      ;;
+    --fix-reasoning=*) FIX_REASONING_FLAG="${1#*=}"; FIX_REASONING_FLAG_SET=true; shift ;;
     --verify-model) VERIFY_MODEL_FLAG="$2"; VERIFY_MODEL_FLAG_SET=true; shift 2 ;;
     --verify-model=*) VERIFY_MODEL_FLAG="${1#*=}"; VERIFY_MODEL_FLAG_SET=true; shift ;;
     --verify-reasoning) VERIFY_REASONING_FLAG="$2"; VERIFY_REASONING_FLAG_SET=true; shift 2 ;;
     --verify-reasoning=*) VERIFY_REASONING_FLAG="${1#*=}"; VERIFY_REASONING_FLAG_SET=true; shift ;;
     --test-cmd)    TEST_CMD_FLAG="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
+    --focused-test-cmd)
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        FOCUSED_TEST_CMD_FLAG=""
+        shift
+      else
+        FOCUSED_TEST_CMD_FLAG="$2"
+        shift 2
+      fi
+      FOCUSED_TEST_CMD_FLAG_SET=true
+      ;;
+    --focused-test-cmd=*) FOCUSED_TEST_CMD_FLAG="${1#*=}"; FOCUSED_TEST_CMD_FLAG_SET=true; shift ;;
+    --final-test-cmd)
+      if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+        FINAL_TEST_CMD_FLAG=""
+        shift
+      else
+        FINAL_TEST_CMD_FLAG="$2"
+        shift 2
+      fi
+      FINAL_TEST_CMD_FLAG_SET=true
+      ;;
+    --final-test-cmd=*) FINAL_TEST_CMD_FLAG="${1#*=}"; FINAL_TEST_CMD_FLAG_SET=true; shift ;;
     --keep-going)  KEEP_GOING=true; shift ;;
     --no-verify)   VERIFY_MODE="off"; shift ;;
     -q|--quiet)    QUIET=true; shift ;;
@@ -246,8 +332,13 @@ LIMIT_WAIT_DEFAULT="${RALPH_LIMIT_WAIT_DEFAULT:-1800}"
 LIMIT_BUFFER="${RALPH_LIMIT_BUFFER:-60}"
 
 TEST_CMD=""
+FOCUSED_TEST_CMD=""
+FINAL_TEST_CMD=""
+CYCLE_TEST_CMD=""
 SAIL_BIN=""
 LIMIT_WAITS=0
+LAST_FOCUSED_TEST_LOG="nenhum"
+LAST_FINAL_TEST_LOG="nenhum"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -516,6 +607,10 @@ validate_system4u_profile() {
 # Ecoa o caminho do binario sail quando o projeto usa Sail.
 detect_sail() {
   [ -f artisan ] || return 1
+  if [ -x ./sail ]; then
+    echo "./sail"
+    return 0
+  fi
   if [ -x vendor/bin/sail ]; then
     echo "vendor/bin/sail"
     return 0
@@ -540,15 +635,25 @@ sail_running() {
 # O comando de teste invoca o sail? Olha o executavel (1o token), nao a string
 # inteira: um caminho como /tmp/sail-fixture/test.sh nao usa sail.
 test_cmd_uses_sail() {
-  local first="${TEST_CMD%% *}"
+  local command="$1"
+  local first="${command%% *}"
+  [ -n "$command" ] || return 1
   [ "$(basename -- "$first")" = "sail" ]
 }
 
 # Gate 2 so tem valor se rodar de verdade. Sail com containers parados falha
 # toda fase e queima ciclos de correcao inuteis — aborta antes da 1a sessao.
 check_sail_running() {
+  local command uses_sail=false
   [ -n "$SAIL_BIN" ] || return 0
-  test_cmd_uses_sail || return 0
+
+  for command in "$CYCLE_TEST_CMD" "$FINAL_TEST_CMD"; do
+    if test_cmd_uses_sail "$command"; then
+      uses_sail=true
+      break
+    fi
+  done
+  [ "$uses_sail" = true ] || return 0
 
   if [ ! -x "$SAIL_BIN" ]; then
     fail "Laravel Sail detectado, mas $SAIL_BIN nao existe."
@@ -573,39 +678,62 @@ resolve_test_cmd() {
   if [ -n "$TEST_CMD_FLAG" ]; then
     TEST_CMD="$TEST_CMD_FLAG"
     log "Gate 2 — comando de teste (--test-cmd): $TEST_CMD"
-    check_sail_running
-    return 0
-  fi
-
-  if [ -n "${RALPH_TEST_CMD:-}" ]; then
+  elif [ -n "${RALPH_TEST_CMD:-}" ]; then
     TEST_CMD="$RALPH_TEST_CMD"
     log "Gate 2 — comando de teste (RALPH_TEST_CMD): $TEST_CMD"
-    check_sail_running
-    return 0
-  fi
-
-  # Sail vem ANTES de composer/npm: num projeto Laravel dockerizado o host nao
-  # tem PHP nem acesso ao banco, e `composer test` mentiria como gate.
-  if [ -n "$SAIL_BIN" ]; then
-    TEST_CMD="$SAIL_BIN test"
-  elif [ -f composer.json ] && grep -qE '"test"[[:space:]]*:' composer.json; then
-    TEST_CMD="composer test"
-  elif [ -f artisan ]; then
-    TEST_CMD="php artisan test"
-  elif [ -f package.json ] && grep -qE '"test"[[:space:]]*:' package.json; then
-    TEST_CMD="npm test"
-  elif [ -f pytest.ini ] || { [ -f pyproject.toml ] && grep -qF '[tool.pytest' pyproject.toml; }; then
-    TEST_CMD="pytest"
-  elif [ -f go.mod ]; then
-    TEST_CMD="go test ./..."
-  elif [ -f Cargo.toml ]; then
-    TEST_CMD="cargo test"
-  fi
-
-  if [ -n "$TEST_CMD" ]; then
-    log "Gate 2 — comando de teste (detectado): $TEST_CMD"
-    check_sail_running
   else
+    # Sail vem ANTES de composer/npm: num projeto Laravel dockerizado o host nao
+    # tem PHP nem acesso ao banco, e `composer test` mentiria como gate.
+    if [ -n "$SAIL_BIN" ]; then
+      TEST_CMD="$SAIL_BIN test"
+    elif [ -f composer.json ] && grep -qE '"test"[[:space:]]*:' composer.json; then
+      TEST_CMD="composer test"
+    elif [ -f artisan ]; then
+      TEST_CMD="php artisan test"
+    elif [ -f package.json ] && grep -qE '"test"[[:space:]]*:' package.json; then
+      TEST_CMD="npm test"
+    elif [ -f pytest.ini ] || { [ -f pyproject.toml ] && grep -qF '[tool.pytest' pyproject.toml; }; then
+      TEST_CMD="pytest"
+    elif [ -f go.mod ]; then
+      TEST_CMD="go test ./..."
+    elif [ -f Cargo.toml ]; then
+      TEST_CMD="cargo test"
+    fi
+
+    if [ -n "$TEST_CMD" ]; then
+      log "Gate 2 — comando de teste (detectado): $TEST_CMD"
+    fi
+  fi
+
+  if [ "$FOCUSED_TEST_CMD_FLAG_SET" = true ]; then
+    FOCUSED_TEST_CMD="$FOCUSED_TEST_CMD_FLAG"
+  elif [ -n "${RALPH_FOCUSED_TEST_CMD:-}" ]; then
+    FOCUSED_TEST_CMD="$RALPH_FOCUSED_TEST_CMD"
+  fi
+
+  if [ "$FINAL_TEST_CMD_FLAG_SET" = true ]; then
+    FINAL_TEST_CMD="$FINAL_TEST_CMD_FLAG"
+  elif [ -n "${RALPH_FINAL_TEST_CMD:-}" ]; then
+    FINAL_TEST_CMD="$RALPH_FINAL_TEST_CMD"
+  fi
+
+  if [ -n "$FOCUSED_TEST_CMD" ]; then
+    CYCLE_TEST_CMD="$FOCUSED_TEST_CMD"
+    [ -n "$FINAL_TEST_CMD" ] || FINAL_TEST_CMD="$TEST_CMD"
+    if [ -z "$FINAL_TEST_CMD" ]; then
+      fail "Teste focado configurado sem suite final. Passe --final-test-cmd, --test-cmd ou RALPH_FINAL_TEST_CMD."
+      exit 1
+    fi
+    log "Gate 2a — teste focado por ciclo: $CYCLE_TEST_CMD"
+    log "Gate 2b — suite final apos foco verde: $FINAL_TEST_CMD"
+  else
+    CYCLE_TEST_CMD="${FINAL_TEST_CMD:-$TEST_CMD}"
+    FINAL_TEST_CMD=""
+  fi
+
+  check_sail_running
+
+  if [ -z "$CYCLE_TEST_CMD" ]; then
     warn "Gate 2 DESABILITADO: nenhum comando de teste resolvido."
     if [ "$VERIFY_MODE" = "off" ]; then
       warn "--no-verify tambem desligou o gate 3: NENHUMA validacao mecanica ativa."
@@ -624,6 +752,28 @@ preflight_checks() {
   if ! [[ "$FROM_PHASE" =~ ^[0-9]+$ ]]; then
     fail "Valor invalido para --from: '$FROM_PHASE'. Use um numero inteiro (ex: --from 5)."
     exit 1
+  fi
+
+  if [ "$ONLY_PHASE_FLAG_SET" = true ]; then
+    if ! [[ "$ONLY_PHASE" =~ ^[0-9]+$ ]] || [ "$ONLY_PHASE" -lt 1 ]; then
+      fail "Valor invalido para --only-phase: '$ONLY_PHASE'. Use um inteiro >= 1."
+      exit 1
+    fi
+    if [ "$FROM_PHASE_FLAG_SET" = true ] || [ "$STOP_AFTER_PHASE_FLAG_SET" = true ]; then
+      fail "--only-phase nao pode ser combinado com --from ou --stop-after."
+      exit 1
+    fi
+  fi
+
+  if [ "$STOP_AFTER_PHASE_FLAG_SET" = true ]; then
+    if ! [[ "$STOP_AFTER_PHASE" =~ ^[0-9]+$ ]] || [ "$STOP_AFTER_PHASE" -lt 1 ]; then
+      fail "Valor invalido para --stop-after: '$STOP_AFTER_PHASE'. Use um inteiro >= 1."
+      exit 1
+    fi
+    if [ "$FROM_PHASE" -gt 0 ] && [ "$FROM_PHASE" -gt "$STOP_AFTER_PHASE" ]; then
+      fail "--from $FROM_PHASE fica depois de --stop-after $STOP_AFTER_PHASE."
+      exit 1
+    fi
   fi
 
   if ! [[ "$MAX_CYCLES" =~ ^[0-9]+$ ]] || [ "$MAX_CYCLES" -lt 1 ]; then
@@ -675,6 +825,18 @@ preflight_checks() {
     REASONING="$RALPH_REASONING"
   fi
 
+  if [ "$FIX_REASONING_FLAG_SET" = true ]; then
+    if [ -z "$FIX_REASONING_FLAG" ]; then
+      fail "--fix-reasoning exige um valor nao vazio para os ciclos corretivos."
+      exit 1
+    fi
+    FIX_REASONING="$FIX_REASONING_FLAG"
+  elif [ -n "${RALPH_FIX_REASONING:-}" ]; then
+    FIX_REASONING="$RALPH_FIX_REASONING"
+  else
+    FIX_REASONING="$REASONING"
+  fi
+
   if [[ "$ENGINE" == "codex" && -n "$REASONING" ]]; then
     case "$REASONING" in
       minimal|low|medium|high|xhigh) ;;
@@ -685,6 +847,29 @@ preflight_checks() {
     esac
   elif [[ "$ENGINE" == "claude" && -n "$REASONING" ]]; then
     fail "Reasoning de implementacao/correcao nao e compativel com o engine Claude. Remova --reasoning/RALPH_REASONING."
+    exit 1
+  fi
+
+  if [[ "$ENGINE" == "codex" && -n "$FIX_REASONING" ]]; then
+    case "$FIX_REASONING" in
+      minimal|low|medium|high|xhigh) ;;
+      *)
+        fail "Reasoning invalido para os ciclos corretivos Codex: '$FIX_REASONING'. Use minimal, low, medium, high ou xhigh."
+        exit 1
+        ;;
+    esac
+  elif [[ "$ENGINE" == "claude" && -n "$FIX_REASONING" ]]; then
+    fail "Reasoning de correcao nao e compativel com o engine Claude. Remova --fix-reasoning/RALPH_FIX_REASONING."
+    exit 1
+  fi
+
+  if [ "$FOCUSED_TEST_CMD_FLAG_SET" = true ] && [ -z "$FOCUSED_TEST_CMD_FLAG" ]; then
+    fail "--focused-test-cmd exige um comando nao vazio."
+    exit 1
+  fi
+
+  if [ "$FINAL_TEST_CMD_FLAG_SET" = true ] && [ -z "$FINAL_TEST_CMD_FLAG" ]; then
+    fail "--final-test-cmd exige um comando nao vazio."
     exit 1
   fi
 
@@ -784,6 +969,11 @@ preflight_checks() {
 # ---------------------------------------------------------------------------
 
 manifest_entries() { grep -v '^#' "$MANIFEST" || true; }
+
+manifest_has_phase_number() {
+  local requested="$1"
+  awk -F'|' -v requested="$requested" '$2 == requested { found = 1 } END { exit(found ? 0 : 1) }' < <(manifest_entries)
+}
 
 split_phases() {
   log "Quebrando $INPUT_FILE em fases..."
@@ -915,18 +1105,28 @@ SYSTEM4U
     sed 's/^/    - /' "$ALLOWED_PATHS_FILE"
   fi
 
-  # O gate 2 roda ESTE comando. Se o agente rodar outro (ex: `php artisan test`
-  # no host de um projeto Sail), ele ve verde e o gate ve vermelho.
-  if [ -n "$TEST_CMD" ]; then
+  test_runtime_guidance
+}
+
+test_runtime_guidance() {
+  if [ -n "$CYCLE_TEST_CMD" ]; then
     echo
-    echo "## Comando de teste deste projeto"
-    echo "Rode a suite SEMPRE com:"
+    echo "## Validacao mecanica executada pelo Ralph"
+    echo "O Ralph executara fora desta sessao, no host, o seguinte comando:"
     echo
-    echo "    $TEST_CMD"
+    echo "    $CYCLE_TEST_CMD"
+    if [ -n "$FINAL_TEST_CMD" ]; then
+      echo
+      echo "Depois que o teste focado ficar verde, o Ralph executara a suite final:"
+      echo
+      echo "    $FINAL_TEST_CMD"
+    fi
     echo
-    echo "Este e o comando exato usado para validar a fase. Nao use outro runner"
-    echo "nem rode os testes por fora dele."
-    if [[ "$TEST_CMD" == docker\ compose\ exec* ]]; then
+    echo "Se o sandbox permitir, execute o comando focado para feedback. Se Docker/Sail"
+    echo "nao estiver acessivel dentro da sessao, nao tente repetidamente, nao troque de"
+    echo "runner e nao conclua que o host esta sem Docker: deixe o Ralph executar os"
+    echo "gates no host depois que a sessao terminar."
+    if [[ "$CYCLE_TEST_CMD" == docker\ compose\ exec* ]]; then
       echo "O projeto usa Docker Compose: artisan, composer, php e testes rodam DENTRO"
       echo "do servico da aplicacao, via 'docker compose exec -T app <cmd>'. Nunca use Sail"
       echo "nem rode essas ferramentas no host."
@@ -935,6 +1135,33 @@ SYSTEM4U
       echo "do container, via '$SAIL_BIN <cmd>'. Nunca rode essas ferramentas no host."
     fi
   fi
+}
+
+correction_context_preamble() {
+  cat <<'PREAMBLE'
+## Contexto enxuto de correcao
+Leia uma vez `AGENTS.md` ou `CLAUDE.md` para respeitar as regras do projeto.
+Depois, inspecione somente a fase abaixo, o codigo atual, os arquivos alterados
+e os testes diretamente relacionados ao finding. Nao releia logs historicos de
+`.phases/`/`.ralph-*` nem toda a cadeia `.spec/init/`; a causa exata do gate ja
+esta reproduzida neste prompt. Consulte documentacao adicional apenas quando o
+finding ou a fase apontar explicitamente para ela.
+PREAMBLE
+
+  if is_system4u_profile; then
+    cat <<'SYSTEM4U'
+
+## Limites do perfil system4u-autonomous
+Permaneca em workspace-write e altere exclusivamente os paths da allowlist.
+Nao leia arquivos de ambiente, nao instale dependencias, nao execute migrations,
+nao acione provedores, pagamentos, deploy, push, merge, tag ou release. Nao faca
+commits, exclusoes ou renomes.
+
+SYSTEM4U
+    sed 's/^/    - /' "$ALLOWED_PATHS_FILE"
+  fi
+
+  test_runtime_guidance
 }
 
 build_impl_prompt() {
@@ -953,7 +1180,7 @@ Implemente COMPLETAMENTE a fase descrita abaixo.
 Para cada item:
 1. Implemente o codigo completo (nao deixe TODOs ou placeholders)
 2. Crie os testes listados, seguindo o framework de testes do projeto
-3. Rode os testes com o comando de teste do projeto
+3. Rode os testes focados quando o runtime estiver acessivel nesta sessao
 4. Se um teste falhar, corrija o codigo e rode novamente
 5. So passe pro proximo item quando os testes passarem
 
@@ -963,7 +1190,8 @@ Para cada item:
 - Testes e fixtures/factories devem criar todas as dependencias necessarias
 - Nomes de classes, arquivos e metodos devem seguir EXATAMENTE o que esta descrito
 - Nao pule nenhum item marcado com [ ]
-- Ao final, valide que toda a suite de testes da fase passa
+- Ao final, revise estaticamente a implementacao; o Ralph executara os gates
+  de teste configurados no host
 
 ## Fase a implementar
 TASK
@@ -982,7 +1210,7 @@ build_fix_prompt() {
   {
     echo "Voce e um desenvolvedor senior corrigindo uma fase parcialmente implementada."
     echo
-    context_preamble
+    correction_context_preamble
     cat <<'INTRO'
 
 ## Situacao
@@ -993,7 +1221,8 @@ antes de mudar qualquer coisa.
 ## Regras obrigatorias
 - Corrija APENAS o que falta. Nao reimplemente o que ja esta correto e testado.
 - Nao deixe TODOs, placeholders ou testes pulados.
-- Rode a suite de testes do projeto ao final e garanta que ela passa.
+- Rode os testes focados quando o runtime estiver acessivel; o Ralph executa os
+  gates mecanicos no host depois que esta sessao terminar.
 - Requisitos de autenticacao, autorizacao, isolamento, policies, gates ou permissoes da aplicacao sao escopo funcional aprovado quando constam do texto da fase ou da causa do gate. Implemente e teste esses requisitos sem pausar apenas por envolverem autorizacao.
 - Essa autorizacao funcional nao amplia a autorizacao operacional: nao contorne sandbox, allowlist, regras do projeto, segredos, chamadas externas nao autorizadas ou outros limites operacionais; nao execute migrations destrutivas, deploy, push nem alteracoes fora do escopo da fase.
 INTRO
@@ -1002,6 +1231,9 @@ INTRO
     echo '```'
     echo "$cause"
     echo '```'
+    echo
+    echo "## Arquivos alterados atualmente"
+    phase_changed_paths | sed 's/^/    - /'
     echo
     echo "## Fase a completar"
     cat "$PHASES_DIR/$phase_file"
@@ -1033,7 +1265,18 @@ Regras:
 - Uma linha TASK para cada task, sem excecao, sem agrupar.
 - Nao emita nenhum outro texto alem das linhas TASK.
 - Codigo ausente, TODO, placeholder ou teste faltando => INCOMPLETE.
+- A evidencia mecanica abaixo foi produzida pelo Ralph fora desta sandbox e e
+  autoritativa quanto a execucao. Nao reexecute a suite e nao marque uma task
+  INCOMPLETE apenas porque Docker/Sail nao esta acessivel no verificador.
+- Continue conferindo se os testes exigidos existem e se cobrem os criterios.
 - Na duvida, INCOMPLETE.
+
+## Evidencia mecanica do Ralph
+VERIFY
+    printf 'Resultado: %s\n' "$LAST_TEST_RESULT"
+    printf 'Log focado: %s\n' "$LAST_FOCUSED_TEST_LOG"
+    printf 'Log final: %s\n' "$LAST_FINAL_TEST_LOG"
+    cat <<'VERIFY'
 
 ## Fase a verificar
 VERIFY
@@ -1167,6 +1410,11 @@ run_engine() {
 
   local model_args=() reasoning_args=()
   local session_model="herdado" session_reasoning="herdado" session_sandbox="n/a"
+  local mutable_reasoning="$REASONING"
+
+  if [[ "$mode" == "impl" && "${RALPH_PHASE_ATTEMPT:-1}" -gt 1 ]]; then
+    mutable_reasoning="$FIX_REASONING"
+  fi
 
   if [[ "$mode" == "impl" ]]; then
     if [ -n "$MODEL" ]; then
@@ -1174,8 +1422,8 @@ run_engine() {
     fi
     if [[ "$ENGINE" == "claude" ]]; then
       session_reasoning="nao aplicavel"
-    elif [ -n "$REASONING" ]; then
-      session_reasoning="$REASONING"
+    elif [ -n "$mutable_reasoning" ]; then
+      session_reasoning="$mutable_reasoning"
     fi
   else
     if [ -n "$VERIFY_MODEL" ]; then
@@ -1205,8 +1453,8 @@ run_engine() {
   elif [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
     model_args=(--model "$VERIFY_MODEL")
   fi
-  if [[ "$mode" == "impl" && "$ENGINE" == "codex" ]] && [ -n "$REASONING" ]; then
-    reasoning_args=(-c "model_reasoning_effort=\"$REASONING\"")
+  if [[ "$mode" == "impl" && "$ENGINE" == "codex" ]] && [ -n "$mutable_reasoning" ]; then
+    reasoning_args=(-c "model_reasoning_effort=\"$mutable_reasoning\"")
   elif [[ "$mode" == "verify" && "$ENGINE" == "codex" ]] && [ -n "$VERIFY_REASONING" ]; then
     reasoning_args=(-c "model_reasoning_effort=\"$VERIFY_REASONING\"")
   fi
@@ -1262,6 +1510,29 @@ run_engine() {
 # Gates
 # ---------------------------------------------------------------------------
 
+# Mantem a causa corretiva util sem permitir que snapshots/HTML serializado
+# transformem uma unica falha em centenas de KB de prompt.
+bounded_log_excerpt() {
+  local log_file="$1"
+  local original_bytes original_lines excerpt truncated=false
+
+  [ -f "$log_file" ] || return 0
+  original_bytes=$(wc -c < "$log_file")
+  original_lines=$(wc -l < "$log_file")
+
+  if [ "$original_bytes" -gt 20000 ] || [ "$original_lines" -gt 120 ]; then
+    truncated=true
+  elif awk 'length($0) > 2000 { found = 1 } END { exit(found ? 0 : 1) }' "$log_file"; then
+    truncated=true
+  fi
+
+  excerpt=$(tail -n 120 "$log_file" | cut -c 1-2000 | tail -c 20000)
+  printf '%s\n' "$excerpt"
+  if [ "$truncated" = true ]; then
+    printf '[saida limitada pelo Ralph: %s bytes no log completo; consulte %s]\n' "$original_bytes" "$log_file"
+  fi
+}
+
 # Gate 0 — o engine terminou de verdade?
 # Preenche GATE_CAUSE quando vermelho.
 GATE_CAUSE=""
@@ -1271,17 +1542,17 @@ gate0_engine_finished() {
 
   if [[ "$ENGINE" == "claude" ]]; then
     if ! grep -qF '"type":"result"' "$log_file" && ! grep -qF '"type": "result"' "$log_file"; then
-      GATE_CAUSE="O engine terminou sem emitir um resultado. Ultimas linhas do output:"$'\n'"$(tail -n 40 "$log_file")"
+      GATE_CAUSE="O engine terminou sem emitir um resultado. Ultimas linhas do output:"$'\n'"$(bounded_log_excerpt "$log_file")"
       return 1
     fi
     if grep -qE '"is_error"[[:space:]]*:[[:space:]]*true' "$log_file"; then
-      GATE_CAUSE="O engine reportou is_error=true. Ultimas linhas do output:"$'\n'"$(tail -n 40 "$log_file")"
+      GATE_CAUSE="O engine reportou is_error=true. Ultimas linhas do output:"$'\n'"$(bounded_log_excerpt "$log_file")"
       return 1
     fi
   fi
 
   if [ "$rc" -ne 0 ]; then
-    GATE_CAUSE="O engine saiu com codigo $rc. Ultimas linhas do output:"$'\n'"$(tail -n 40 "$log_file")"
+    GATE_CAUSE="O engine saiu com codigo $rc. Ultimas linhas do output:"$'\n'"$(bounded_log_excerpt "$log_file")"
     return 1
   fi
 
@@ -1358,28 +1629,69 @@ gate1_session_wrote() {
   [ "$(tree_signature)" != "$sig_before" ]
 }
 
-# Gate 2 — a suite do projeto passa, rodada PELO ralph (fora da sessao do agente)?
-gate2_tests_pass() {
-  local test_log="$1"
+# Gate 2 — comandos executados pelo Ralph no host, nunca confiados ao agente.
+gate2_command_pass() {
+  local command="$1" test_log="$2" gate_label="$3"
 
-  if [ -z "$TEST_CMD" ]; then
-    LAST_TEST_RESULT="Gate 2 nao configurado"
-    return 0
-  fi
-
-  log "Gate 2 — rodando a suite do projeto: $TEST_CMD"
+  log "$gate_label — executando: $command"
   local rc=0
   # < /dev/null: sail test (docker compose exec) anexa stdin e consumiria o
   # stream de quem chamou, alem de poder travar esperando input.
-  bash -c "$TEST_CMD" < /dev/null > "$test_log" 2>&1 || rc=$?
+  bash -c "$command" < /dev/null > "$test_log" 2>&1 || rc=$?
 
   if [ "$rc" -ne 0 ]; then
-    GATE_CAUSE="O comando de teste do projeto ('$TEST_CMD') falhou com codigo $rc. Saida:"$'\n'"$(tail -n 200 "$test_log")"
+    GATE_CAUSE="O comando de teste do $gate_label ('$command') falhou com codigo $rc. Saida:"$'\n'"$(bounded_log_excerpt "$test_log")"
     return 1
   fi
 
-  success "Gate 2 — suite verde"
-  LAST_TEST_RESULT="Gate 2 verde"
+  success "$gate_label — verde"
+  return 0
+}
+
+gate2_cycle_tests_pass() {
+  local phase_file="$1" cycle="$2" test_log
+
+  if [ -z "$CYCLE_TEST_CMD" ]; then
+    LAST_TEST_RESULT="Gate 2 nao configurado"
+    LAST_FOCUSED_TEST_LOG="nenhum"
+    return 0
+  fi
+
+  if [ -n "$FINAL_TEST_CMD" ]; then
+    test_log="$LOG_DIR/${phase_file%.md}.focused-${cycle}.log"
+    LAST_FOCUSED_TEST_LOG="$test_log"
+    if ! gate2_command_pass "$CYCLE_TEST_CMD" "$test_log" "Gate 2a"; then
+      LAST_TEST_RESULT="Gate 2a vermelho"
+      return 1
+    fi
+    LAST_TEST_RESULT="Gate 2a verde"
+  else
+    test_log="$LOG_DIR/${phase_file%.md}.test-${cycle}.log"
+    LAST_FOCUSED_TEST_LOG="nenhum"
+    LAST_FINAL_TEST_LOG="$test_log"
+    if ! gate2_command_pass "$CYCLE_TEST_CMD" "$test_log" "Gate 2"; then
+      LAST_TEST_RESULT="Gate 2 vermelho"
+      return 1
+    fi
+    LAST_TEST_RESULT="Gate 2 verde"
+  fi
+
+  return 0
+}
+
+gate2_final_tests_pass() {
+  local phase_file="$1" cycle="$2" test_log
+
+  [ -n "$FINAL_TEST_CMD" ] || return 0
+  test_log="$LOG_DIR/${phase_file%.md}.test-${cycle}.log"
+  LAST_FINAL_TEST_LOG="$test_log"
+
+  if ! gate2_command_pass "$FINAL_TEST_CMD" "$test_log" "Gate 2b"; then
+    LAST_TEST_RESULT="Gate 2a verde; Gate 2b vermelho"
+    return 1
+  fi
+
+  LAST_TEST_RESULT="Gate 2a verde; Gate 2b verde"
   return 0
 }
 
@@ -1411,7 +1723,7 @@ gate3_independent_verify() {
       return 0
       ;;
     auto)
-      if [ "$cycle" -eq 1 ] && [ "$session_wrote" -eq 1 ] && [ -n "$TEST_CMD" ]; then
+      if [ "$cycle" -eq 1 ] && [ "$session_wrote" -eq 1 ] && [ -n "$CYCLE_TEST_CMD" ]; then
         log "Gate 3 pulado: a sessao escreveu codigo e a suite passou (RALPH_VERIFY=always para rodar sempre)"
         LAST_VERIFY_RESULT="Gate 3 pulado (modo auto)"
         return 0
@@ -1563,6 +1875,8 @@ run_phase() {
   LIMIT_WAITS=0
   GATE_CAUSE=""
   LAST_TEST_RESULT="Gate 2 nao executado"
+  LAST_FOCUSED_TEST_LOG="nenhum"
+  LAST_FINAL_TEST_LOG="nenhum"
   LAST_VERIFY_RESULT="Gate 3 nao executado"
   LAST_PHASE_COMMIT="nenhum"
   LAST_PHASE_FILES="nenhum"
@@ -1609,10 +1923,19 @@ run_phase() {
       LAST_GATE="guardrail System4u"
       GATE_CAUSE="$SYSTEM4U_GUARD_CAUSE"
       fail "Guardrail System4u vermelho — alteracao fora da allowlist ou exclusao automatica"
-    elif ! gate2_tests_pass "$LOG_DIR/${phase_file%.md}.test-${cycle}.log"; then
-      LAST_GATE="gate 2 — suite de testes do projeto"
+    elif ! gate2_cycle_tests_pass "$phase_file" "$cycle"; then
+      if [ -n "$FINAL_TEST_CMD" ]; then
+        LAST_GATE="gate 2a — testes focados"
+        fail "Gate 2a vermelho — testes focados falharam"
+      else
+        LAST_GATE="gate 2 — suite de testes do projeto"
+        fail "Gate 2 vermelho — testes do projeto falharam"
+      fi
       GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
-      fail "Gate 2 vermelho — testes do projeto falharam"
+    elif ! gate2_final_tests_pass "$phase_file" "$cycle"; then
+      LAST_GATE="gate 2b — suite final do projeto"
+      GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
+      fail "Gate 2b vermelho — suite final falhou"
     elif ! gate3_independent_verify "$phase_file" "$cycle" "$session_wrote"; then
       LAST_GATE="gate 3 — verificacao independente"
       GATE_CAUSE="${no_change_note}${GATE_CAUSE}"
@@ -1723,14 +2046,30 @@ main() {
     exit 1
   fi
 
+  if [ "$ONLY_PHASE_FLAG_SET" = true ] && ! manifest_has_phase_number "$ONLY_PHASE"; then
+    fail "--only-phase $ONLY_PHASE nao existe no documento de fases."
+    exit 1
+  fi
+
+  if [ "$STOP_AFTER_PHASE_FLAG_SET" = true ] && ! manifest_has_phase_number "$STOP_AFTER_PHASE"; then
+    fail "--stop-after $STOP_AFTER_PHASE nao existe no documento de fases."
+    exit 1
+  fi
+
   echo ""
   log "$total_phases fases para implementar (engine: $ENGINE, max-cycles: $MAX_CYCLES, max-stalled-cycles: $MAX_STALLED_CYCLES)"
   [ "$FROM_PHASE" -gt 1 ] && log "Iniciando a partir da fase $FROM_PHASE"
+  [ "$ONLY_PHASE_FLAG_SET" = true ] && log "Executando somente a Phase $ONLY_PHASE"
+  [ "$STOP_AFTER_PHASE_FLAG_SET" = true ] && log "Parada configurada depois da Phase $STOP_AFTER_PHASE"
   echo ""
 
   local file num title
   while IFS='|' read -r file num title; do
-    if [ "$num" -lt "$FROM_PHASE" ]; then
+    if [ "$ONLY_PHASE_FLAG_SET" = true ] && [ "$num" -ne "$ONLY_PHASE" ]; then
+      echo -e "  ${BLUE}[$num] $title (fora de --only-phase)${NC}"
+    elif [ "$STOP_AFTER_PHASE_FLAG_SET" = true ] && [ "$num" -gt "$STOP_AFTER_PHASE" ]; then
+      echo -e "  ${BLUE}[$num] $title (depois de --stop-after)${NC}"
+    elif [ "$num" -lt "$FROM_PHASE" ]; then
       echo -e "  ${BLUE}[$num] $title (pulada por --from)${NC}"
     elif is_phase_done "$file"; then
       echo -e "  ${GREEN}[$num] $title (ja completada)${NC}"
@@ -1753,6 +2092,17 @@ main() {
   while IFS='|' read -r -u 3 file num title; do
     seq=$((seq + 1))
 
+    if [ "$ONLY_PHASE_FLAG_SET" = true ] && [ "$num" -ne "$ONLY_PHASE" ]; then
+      log "Pulando Phase $num: $title (fora de --only-phase $ONLY_PHASE)"
+      skipped_phases+=("$title")
+      record_phase_report "$num" "$title" "pulada" "0" "0s" "nao executado" "nao executada" "nenhum" "nenhum" "fora de --only-phase $ONLY_PHASE"
+      continue
+    fi
+
+    if [ "$STOP_AFTER_PHASE_FLAG_SET" = true ] && [ "$num" -gt "$STOP_AFTER_PHASE" ]; then
+      break
+    fi
+
     if [ "$num" -lt "$FROM_PHASE" ]; then
       log "Pulando Phase $num: $title (antes de --from $FROM_PHASE)"
       skipped_phases+=("$title")
@@ -1769,6 +2119,10 @@ main() {
 
     if run_phase "$file" "$num" "$title" "$seq" "$total_phases"; then
       completed_phases+=("$title")
+      if [ "$STOP_AFTER_PHASE_FLAG_SET" = true ] && [ "$num" -eq "$STOP_AFTER_PHASE" ]; then
+        log "Parada solicitada apos a Phase $STOP_AFTER_PHASE; nenhuma fase seguinte sera iniciada."
+        break
+      fi
     else
       failed_phases+=("$title")
       if $KEEP_GOING; then
