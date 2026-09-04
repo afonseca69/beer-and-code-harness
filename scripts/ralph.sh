@@ -1462,14 +1462,18 @@ run_engine() {
   while true; do
     local rc=0
     : > "$log_file"
+    # Nunca reaproveite uma resposta de uma tentativa anterior por usage limit.
+    if [[ "$ENGINE" == "codex" && "$mode" == "verify" ]]; then
+      : > "${log_file%.log}.final.txt" || return 1
+    fi
     announce_engine_session "$log_file" "$mode" "$session_sandbox" "$session_model" "$session_reasoning"
 
     if [[ "$ENGINE" == "codex" ]]; then
       if [[ "$mode" == "verify" ]]; then
         if is_system4u_profile; then
-          rtk codex exec -c 'approval_policy="never"' --sandbox read-only "${model_args[@]}" "${reasoning_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
+          rtk codex exec -c 'approval_policy="never"' --sandbox read-only --output-last-message "${log_file%.log}.final.txt" "${model_args[@]}" "${reasoning_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
         else
-          rtk codex exec --sandbox read-only "${model_args[@]}" "${reasoning_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
+          rtk codex exec --sandbox read-only --output-last-message "${log_file%.log}.final.txt" "${model_args[@]}" "${reasoning_args[@]}" - < "$prompt_file" 2>&1 | capture_engine_output "$log_file" "$mode" || rc=$?
         fi
       else
         if is_system4u_profile; then
@@ -1743,7 +1747,14 @@ gate3_independent_verify() {
   GATE3_RAN=1
   local prompt_file
   prompt_file=$(build_verify_prompt "$phase_file" "$cycle")
-  run_engine "$prompt_file" "$verify_log" verify || true
+  local verify_rc=0
+  run_engine "$prompt_file" "$verify_log" verify || verify_rc=$?
+
+  if [ "$verify_rc" -ne 0 ]; then
+    GATE_CAUSE="O verificador saiu com codigo $verify_rc. O Gate 3 exige uma sessao concluida com sucesso. Log: $verify_log"
+    set_gate3_red_result 0 "$expected" "indisponivel" "$cycle" "$verify_log"
+    return 1
+  fi
 
   if [ ! -e "$verify_log" ]; then
     GATE_CAUSE="Log de verificacao ausente: $verify_log. O Gate 3 nao pode aprovar sem evidencia do verificador."
@@ -1757,9 +1768,39 @@ gate3_independent_verify() {
     return 1
   fi
 
+  local response_file="$verify_log"
+  if [[ "$ENGINE" == "codex" ]]; then
+    response_file="${verify_log%.log}.final.txt"
+    if [ ! -s "$response_file" ]; then
+      GATE_CAUSE="Resposta final do verificador ausente ou vazia: $response_file. O transcript nao substitui a resposta final."
+      set_gate3_red_result 0 "$expected" "indisponivel" "$cycle" "$verify_log"
+      return 1
+    fi
+    # O transcript pode repetir a resposta e conter TASKs de ferramentas/logs
+    # historicos. Apenas o arquivo final do CLI e autoridade para o checklist.
+    if ! awk -v expected="$expected" '
+      /^[[:space:]]*$/ { next }
+      {
+        sub(/^[[:space:]]*/, "")
+        if ($0 !~ /^TASK [1-9][0-9]*: (DONE[[:space:]]*$|INCOMPLETE([[:space:]]|$))/) {
+          invalid = 1
+          next
+        }
+        number = $2
+        sub(/:$/, "", number)
+        if (number + 0 > expected || seen[number]++) invalid = 1
+      }
+      END { exit(invalid ? 1 : 0) }
+    ' "$response_file"; then
+      GATE_CAUSE="Resposta final invalida: formato TASK, identificador fora da fase ou task duplicada em $response_file."
+      set_gate3_red_result 0 "$expected" "indisponivel" "$cycle" "$verify_log"
+      return 1
+    fi
+  fi
+
   local task_lines
   task_lines=$(
-    sed 's/^[[:space:]]*//' "$verify_log" |
+    sed 's/^[[:space:]]*//' "$response_file" |
       grep -E '^TASK [0-9]+: (DONE|INCOMPLETE)' |
       awk -v expected="$expected" '
         BEGIN {

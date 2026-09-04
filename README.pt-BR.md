@@ -274,6 +274,8 @@ Antes de cada verificação, o terminal registra o estado `gravando`, engine, mo
 
 Os artefatos são separados por fase e ciclo em `.phases/logs/` por padrão, ou em `<run-dir>/logs/` com `system4u-autonomous`: `phase-NN.cycle-C.log` para implementação/correção, `phase-NN.focused-C.log` para o Gate 2a em estágios, `phase-NN.test-C.log` para o Gate 2 legado ou Gate 2b e `phase-NN.verify-C.log` para o Gate 3. Todo Gate 3 executado exige um log de verificação existente e não vazio; ausência ou arquivo vazio deixa o gate vermelho com causa operacional explícita e o caminho correspondente no resumo.
 
+No Codex, o Gate 3 também exige `phase-NN.verify-C.final.txt`, gravado pela opção `--output-last-message` do CLI. Somente essa resposta final fornece os vereditos das tasks; saídas de ferramentas e respostas repetidas no transcript nunca servem de fallback. O checklist final deve conter exatamente uma linha `TASK` válida para cada ID entre 1 e o total de tasks da fase. Respostas ausentes/vazias, linhas malformadas, IDs duplicados ou fora da fase, cobertura incompleta e vereditos `INCOMPLETE` deixam o gate vermelho. O arquivo final é esvaziado antes de cada retry por limite de uso. Exit code não zero do verificador reprova o Gate 3 mesmo que ele tenha emitido linhas `DONE`. O transcript completo permanece disponível para auditoria, e o Claude mantém seu caminho de parsing da saída textual.
+
 ### Autorização funcional versus operacional
 
 Um finding de autenticação, autorização, isolamento, policy, gate ou permissão **da aplicação** é corrigível sem pausa quando aparece no texto aprovado da fase ou na causa do gate; o ciclo corretivo deve implementar e testar esse requisito funcional.

@@ -275,6 +275,8 @@ Before each verification, the terminal records `gravando` (recording), engine, r
 
 Artifacts are separated by phase and cycle under `.phases/logs/` by default, or `<run-dir>/logs/` with `system4u-autonomous`: `phase-NN.cycle-C.log` for implementation/fixes, `phase-NN.focused-C.log` for staged Gate 2a, `phase-NN.test-C.log` for the legacy Gate 2 or staged Gate 2b, and `phase-NN.verify-C.log` for Gate 3. Every Gate 3 run requires an existing, non-empty verification log; a missing or empty file leaves the gate red with an explicit operational cause and the corresponding path in the summary.
 
+For Codex, Gate 3 also requires `phase-NN.verify-C.final.txt`, written by the CLI's `--output-last-message` option. Only that final response supplies task verdicts; tool output and repeated answers in the transcript are never used as fallback. The final checklist must contain exactly one valid `TASK` line for every ID from 1 through the phase's task count. Missing/empty responses, malformed lines, duplicate or out-of-range IDs, incomplete coverage, and `INCOMPLETE` verdicts fail closed. The final file is cleared before every usage-limit retry. A nonzero verifier exit code leaves Gate 3 red even if it emitted `DONE` lines. The full transcript remains available for audit, and Claude retains its text-output parsing path.
+
 ### Functional versus operational authorization
 
 An **application-level** authentication, authorization, isolation, policy, gate, or permission finding is fixable without pausing when it appears in the approved phase text or gate cause; the fix cycle must implement and test that functional requirement.

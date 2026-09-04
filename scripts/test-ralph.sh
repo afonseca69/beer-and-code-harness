@@ -75,6 +75,7 @@ bump() {
 
 model=""
 reasoning=""
+last_message=""
 
 if [ "$name" = "claude" ]; then
   # claude -p real le stdin quando nao e TTY: se o ralph nao redirecionar
@@ -107,6 +108,7 @@ else
         fi
         shift 2
         ;;
+      --output-last-message) last_message="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -151,12 +153,13 @@ if [ "$verify" -eq 1 ]; then
     echo "--------"
   fi
 
+  emit_verify_response() {
   implemented=0
   compgen -G "src/impl-*.txt" > /dev/null 2>&1 && implemented=1
 
   if [ "$implemented" -eq 0 ]; then
     for i in $(seq 1 "$tasks"); do echo "TASK $i: INCOMPLETE — nenhum codigo encontrado"; done
-    exit 0
+    return 0
   fi
 
   if [ "$scenario" = "layered-findings" ]; then
@@ -218,12 +221,49 @@ if [ "$verify" -eq 1 ]; then
   elif [[ "$scenario" == "verify-incomplete-once" || "$scenario" == "verify-incomplete-tracked" ]] && [ "$n" -eq 1 ]; then
     echo "TASK 1: INCOMPLETE — o arquivo nao foi criado"
     for i in $(seq 2 "$tasks"); do echo "TASK $i: DONE"; done
-  elif [ "$scenario" = "verify-duplicate" ]; then
-    for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
-    for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
+  elif [ "$scenario" = "verify-final-partial" ]; then
+    echo "TASK 1: DONE"
+  elif [ "$scenario" = "verify-final-incomplete" ]; then
+    echo "TASK 1: INCOMPLETE — falta implementacao"
+    echo "TASK 2: DONE"
+  elif [ "$scenario" = "verify-final-duplicate" ]; then
+    printf 'TASK 1: DONE\nTASK 1: DONE\nTASK 2: DONE\n'
+  elif [ "$scenario" = "verify-final-range" ]; then
+    printf 'TASK 1: DONE\nTASK 2: DONE\nTASK 3: DONE\n'
+  elif [ "$scenario" = "verify-final-malformed" ]; then
+    printf 'TASK 1: DONEgarbage\nTASK 2: DONE\n'
   else
     for i in $(seq 1 "$tasks"); do echo "TASK $i: DONE"; done
   fi
+  }
+  response="$state/verify-response-$n.txt"
+  emit_verify_response > "$response"
+  if [ -n "$last_message" ]; then
+    case "$scenario" in
+      verify-final-missing) rm -f -- "$last_message" ;;
+      verify-final-empty) : > "$last_message" ;;
+      verify-final-stale)
+        if [ "$n" -eq 1 ]; then cp "$response" "$last_message"; fi
+        ;;
+      *) cp "$response" "$last_message" ;;
+    esac
+  fi
+  if [ "$scenario" = "verify-duplicate" ]; then
+    echo 'TASK 1: INCOMPLETE — resultado historico de ferramenta'
+    cat "$response"
+  fi
+  cat "$response"
+  case "$scenario" in
+    verify-final-*)
+      # Tool output is deliberately more optimistic than the final response.
+      printf 'TASK 1: DONE\nTASK 2: DONE\n'
+      ;;
+  esac
+  if [ "$scenario" = "verify-final-stale" ] && [ "$n" -eq 1 ]; then
+    echo 'Rate limit reached. Try again later.'
+    exit 1
+  fi
+  [ "$scenario" = "verify-final-exit" ] && exit 9
   exit 0
 fi
 
@@ -622,16 +662,32 @@ fi
 
 # ---------------------------------------------------------------------------
 # 4b. Codex pode repetir a resposta final no stream combinado. O Gate 3
-#     consolida pelo numero da task antes de validar a cobertura.
+#     usa apenas o arquivo de resposta final, nunca o transcript combinado.
 # ---------------------------------------------------------------------------
 if case_enabled verify-duplicate; then
-  header "4b. verificador duplicado e consolidado por task"
+  header "4b. transcript duplicado nao contamina a resposta final"
   d=$(new_case verify-duplicate)
   rc=$(run_ralph "$d" verify-duplicate --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
   assert_eq 0 "$rc" "exit 0"
   assert_eq 3 "$(commits "$d")" "fases commitadas com uma linha efetiva por task"
   assert_contains "$d/out.log" "Gate 3 — 2/2 tasks confirmadas no codigo" "cobertura usa tasks unicas"
   assert_not_contains "$d/out.log" "cobertura incompleta" "duplicacao nao gera falso negativo"
+  assert_contains "$d/state/codex_args" "--output-last-message" "Codex recebe arquivo final dedicado"
+  assert_eq 2 "$(grep -c '^TASK ' "$d/repo/.phases/logs/phase-01.verify-1.final.txt")" "artefato final contem somente duas tarefas"
+fi
+
+if case_enabled verify-final-required; then
+  header "4d. transcript nao substitui resposta final valida"
+  for scenario in missing empty partial incomplete duplicate range malformed exit stale; do
+    d=$(new_case "verify-final-$scenario")
+    rc=$(run_ralph "$d" "verify-final-$scenario" --engine codex --test-cmd "$d/test.sh" --max-cycles 1 --quiet)
+    assert_eq 1 "$rc" "$scenario deixa Gate 3 vermelho"
+    assert_eq 1 "$(commits "$d")" "$scenario nao cria commit de fase"
+    assert_contains "$d/out.log" "Gate 3 vermelho" "$scenario falha no gate esperado"
+    if [ "$scenario" = stale ]; then
+      assert_eq 2 "$(cat "$d/state/verify_calls")" "retry ocorre sem consumir ciclo"
+    fi
+  done
 fi
 
 # ---------------------------------------------------------------------------
